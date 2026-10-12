@@ -1,4 +1,6 @@
 import sys
+import random
+from math import hypot
 
 from PySide6.QtCore import Qt, QPoint, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor, QLinearGradient
@@ -10,7 +12,6 @@ class RoboMateWindow(QWidget):
         super().__init__()
 
         self.walk_frame = 0
-        self.walk_swing = 0
 
         self.drag_position = QPoint()
         self.eyes_closed = False
@@ -18,12 +19,19 @@ class RoboMateWindow(QWidget):
 
         # Walking settings
         self.is_walking = False
+        self.roaming_enabled = False
         self.walk_direction = 1
-        self.walk_speed = 8
+        self.walk_speed = 4
+        self.target_x = 0
+        self.target_y = 0
 
         self.walk_timer = QTimer(self)
         self.walk_timer.timeout.connect(self.update_walk)
         self.walk_timer.start(30)
+
+        self.idle_wait_timer = QTimer(self)
+        self.idle_wait_timer.setSingleShot(True)
+        self.idle_wait_timer.timeout.connect(self.start_roaming_walk)
 
         # Idle animation values
         self.float_offset = 0
@@ -59,6 +67,8 @@ class RoboMateWindow(QWidget):
                 font-size: 13px;
             }
         """)
+        self.message_label.hide()
+        self.message_id = 0
 
         # Close button
         self.close_button = QPushButton("Close", self)
@@ -84,42 +94,84 @@ class RoboMateWindow(QWidget):
         self.idle_pose_timer.timeout.connect(self.update_idle_pose)
         self.idle_pose_timer.start(1500)
 
-    def toggle_walk(self):
-        self.is_walking = not self.is_walking
+        QTimer.singleShot(
+            500,
+            lambda: self.show_message("Hi! I'm RoboMate 👋", duration=5000)
+        )
 
-        if self.is_walking:
-            self.walk_button.setText("Stop")
-            self.message_label.setText("Let's go! 🤖")
-        else:
+    def show_message(self, text, duration=5000):
+        self.message_id += 1
+        message_id = self.message_id
+        self.message_label.setText(text)
+        self.message_label.show()
+        QTimer.singleShot(duration, lambda: self.hide_message(message_id))
+
+    def hide_message(self, message_id):
+        if message_id == self.message_id:
+            self.message_label.hide()
+
+    def toggle_walk(self):
+        if self.roaming_enabled:
+            self.roaming_enabled = False
+            self.idle_wait_timer.stop()
+            self.is_walking = False
+            self.walk_frame = 0
             self.walk_button.setText("Walk")
-            self.message_label.setText("Hi! I'm RoboMate 👋")
-            self.walk_swing = 0
             self.update()
+            return
+
+        self.roaming_enabled = True
+        self.start_roaming_walk()
+
+    def start_roaming_walk(self):
+        if not self.roaming_enabled:
+            return
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_x = screen.right() - self.width() + 1
+        max_y = screen.bottom() - self.height() + 1
+        self.target_x = random.randint(screen.left(), max_x)
+        self.target_y = random.randint(screen.top(), max_y)
+        self.is_walking = True
+        self.walk_frame = 0
+        self.walk_button.setText("Stop")
+        self.update()
 
     def update_walk(self):
         if not self.is_walking:
             return
 
         screen = QApplication.primaryScreen().availableGeometry()
-        current_x = self.x()
-        current_y = self.y()
-        new_x = current_x + (self.walk_speed * self.walk_direction)
+        max_x = screen.right() - self.width() + 1
+        max_y = screen.bottom() - self.height() + 1
+        dx = self.target_x - self.x()
+        dy = self.target_y - self.y()
+        distance = hypot(dx, dy)
 
-        if new_x + self.width() >= screen.right():
-            self.walk_direction = -1
-            new_x = screen.right() - self.width() - 5
-        elif new_x <= screen.left():
-            self.walk_direction = 1
-            new_x = screen.left() + 5
+        if distance <= self.walk_speed:
+            self.move(self.target_x, self.target_y)
+            self.is_walking = False
+            self.walk_frame = 0
+            self.update()
+            if self.roaming_enabled:
+                self.idle_wait_timer.start(random.randint(4000, 7000))
+            return
+
+        if abs(dx) >= abs(dy) and dx != 0:
+            self.walk_direction = 1 if dx > 0 else -1
+
+        step_x = dx / distance * self.walk_speed
+        step_y = dy / distance * self.walk_speed
+        new_x = round(self.x() + step_x)
+        new_y = round(self.y() + step_y)
+        new_x = max(screen.left(), min(new_x, max_x))
+        new_y = max(screen.top(), min(new_y, max_y))
 
         self.walk_frame += 1
 
-        if self.walk_frame % 4 == 0:
-            self.walk_swing = -self.walk_swing if self.walk_swing != 0 else 6
-
         self.update()
 
-        self.move(new_x, current_y)
+        self.move(new_x, new_y)
 
     def update_idle_animation(self):
         self.float_offset += self.float_direction
@@ -176,8 +228,9 @@ class RoboMateWindow(QWidget):
     def show_happy(self):
         self.expression = "happy"
 
-        self.message_label.setText(
-            "Yay! Let's build something! 🤖"
+        self.show_message(
+            "Yay! Let's build something! 🤖",
+            duration=4000,
         )
 
         self.update()
@@ -189,23 +242,51 @@ class RoboMateWindow(QWidget):
 
     def reset_expression(self):
         self.expression = "normal"
-
-        self.message_label.setText(
-            "Hi! I'm RoboMate 👋"
-        )
-
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
         painter.save()
+
+        if self.is_walking and self.walk_direction == -1:
+            painter.translate(self.width(), 0)
+            painter.scale(-1, 1)
+
         painter.translate(130, 137)
         painter.scale(0.65, 0.65)
         painter.translate(-160, -177)
 
-        y = self.float_offset
-        swing = self.walk_swing if self.is_walking else 0
+        left_leg_x = 0
+        right_leg_x = 0
+        left_leg_y = 0
+        right_leg_y = 0
+        walk_bounce = 0
+
+        if self.is_walking:
+            walk_poses = (
+                (6, -6, 3, -3, 0),
+                (0, 0, 1, 1, 3),
+                (-6, 6, -3, 3, 0),
+                (0, 0, 1, 1, 3),
+            )
+            pose_index = (self.walk_frame // 4) % len(walk_poses)
+            next_pose_index = (pose_index + 1) % len(walk_poses)
+            pose_progress = (self.walk_frame % 4) / 4
+            current_pose = walk_poses[pose_index]
+            next_pose = walk_poses[next_pose_index]
+
+            left_leg_x = current_pose[0] + (next_pose[0] - current_pose[0]) * pose_progress
+            right_leg_x = current_pose[1] + (next_pose[1] - current_pose[1]) * pose_progress
+            left_leg_y = current_pose[2] + (next_pose[2] - current_pose[2]) * pose_progress
+            right_leg_y = current_pose[3] + (next_pose[3] - current_pose[3]) * pose_progress
+            walk_bounce = current_pose[4] + (next_pose[4] - current_pose[4]) * pose_progress
+
+        y = self.float_offset + walk_bounce
+        left_leg_y += self.float_offset
+        right_leg_y += self.float_offset
+        arm_y = y
 
         outline = QPen(QColor("#b8d2dc"), 2)
         shell = QLinearGradient(0, 190 + y, 0, 290 + y)
@@ -215,22 +296,22 @@ class RoboMateWindow(QWidget):
         # Short, chunky legs and oversized rounded feet.
         painter.setPen(outline)
         painter.setBrush(shell)
-        painter.drawRoundedRect(131 - swing, 246 + y, 21, 28, 10, 10)
-        painter.drawRoundedRect(168 + swing, 246 + y, 21, 28, 10, 10)
-        painter.drawEllipse(112 - swing, 265 + y, 51, 27)
-        painter.drawEllipse(157 + swing, 265 + y, 51, 27)
+        painter.drawRoundedRect(131 + left_leg_x, 246 + left_leg_y, 21, 28, 10, 10)
+        painter.drawRoundedRect(168 + right_leg_x, 246 + right_leg_y, 21, 28, 10, 10)
+        painter.drawEllipse(112 + left_leg_x, 265 + left_leg_y, 51, 27)
+        painter.drawEllipse(157 + right_leg_x, 265 + right_leg_y, 51, 27)
 
         # Chubby little arms with round shoulders and small hands.
-        painter.drawRoundedRect(91 + swing, 207 + y, 34, 23, 11, 11)
-        painter.drawRoundedRect(195 - swing, 207 + y, 34, 23, 11, 11)
-        painter.drawEllipse(99 + swing, 198 + y, 32, 32)
-        painter.drawEllipse(189 - swing, 198 + y, 32, 32)
-        painter.drawEllipse(80 + swing, 209 + y, 23, 23)
-        painter.drawEllipse(217 - swing, 209 + y, 23, 23)
+        painter.drawRoundedRect(91, 207 + arm_y, 34, 23, 11, 11)
+        painter.drawRoundedRect(195, 207 + arm_y, 34, 23, 11, 11)
+        painter.drawEllipse(99, 198 + arm_y, 32, 32)
+        painter.drawEllipse(189, 198 + arm_y, 32, 32)
+        painter.drawEllipse(80, 209 + arm_y, 23, 23)
+        painter.drawEllipse(217, 209 + arm_y, 23, 23)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#a6eaf5"))
-        painter.drawEllipse(87 + swing, 215 + y, 8, 8)
-        painter.drawEllipse(225 - swing, 215 + y, 8, 8)
+        painter.drawEllipse(87, 215 + arm_y, 8, 8)
+        painter.drawEllipse(225, 215 + arm_y, 8, 8)
 
         # Scale the complete head, visor, and face together by 88%.
         painter.save()
