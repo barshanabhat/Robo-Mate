@@ -1,10 +1,11 @@
 import sys
 import random
+from datetime import datetime
 from math import hypot
 
 from PySide6.QtCore import Qt, QPoint, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor, QLinearGradient
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QWidget
 
 
 class RoboMateWindow(QWidget):
@@ -16,10 +17,15 @@ class RoboMateWindow(QWidget):
         self.drag_position = QPoint()
         self.eyes_closed = False
         self.expression = "normal"
+        self.is_waving = False
+        self.wave_angle = 0
+        self.wave_direction = 1
+        self.is_sleepy = False
+        self.idle_animation_tick = 0
 
         # Walking settings
         self.is_walking = False
-        self.roaming_enabled = False
+        self.roaming_enabled = True
         self.walk_direction = 1
         self.walk_speed = 4
         self.target_x = 0
@@ -32,6 +38,14 @@ class RoboMateWindow(QWidget):
         self.idle_wait_timer = QTimer(self)
         self.idle_wait_timer.setSingleShot(True)
         self.idle_wait_timer.timeout.connect(self.start_roaming_walk)
+
+        self.wave_timer = QTimer(self)
+        self.wave_timer.setInterval(50)
+        self.wave_timer.timeout.connect(self.update_wave)
+
+        self.inactivity_timer = QTimer(self)
+        self.inactivity_timer.setSingleShot(True)
+        self.inactivity_timer.timeout.connect(self.enter_sleepy_state)
 
         # Idle animation values
         self.float_offset = 0
@@ -53,9 +67,11 @@ class RoboMateWindow(QWidget):
         self.resize(260, 300)
 
         # Message bubble
-        self.message_label = QLabel("Hi! I'm RoboMate 👋", self)
+        self.message_label = QLabel("", self)
         self.message_label.setAlignment(Qt.AlignCenter)
-        self.message_label.setGeometry(10, 5, 240, 45)
+        self.message_label.setGeometry(27, 5, 205, 45)
+        self.message_label.setWordWrap(True)
+        self.message_label.setAttribute(Qt.WA_TransparentForMouseEvents)
 
         self.message_label.setStyleSheet("""
             QLabel {
@@ -63,21 +79,12 @@ class RoboMateWindow(QWidget):
                 color: black;
                 border: 2px solid #00dfff;
                 border-radius: 15px;
-                padding: 6px;
+                padding: 3px;
                 font-size: 13px;
             }
         """)
         self.message_label.hide()
         self.message_id = 0
-
-        # Close button
-        self.close_button = QPushButton("Close", self)
-        self.close_button.setGeometry(140, 255, 90, 32)
-        self.close_button.clicked.connect(QApplication.instance().quit)
-
-        self.walk_button = QPushButton("Walk", self)
-        self.walk_button.setGeometry(30, 255, 90, 32)
-        self.walk_button.clicked.connect(self.toggle_walk)
 
         # Blink timer
         self.blink_timer = QTimer(self)
@@ -94,10 +101,84 @@ class RoboMateWindow(QWidget):
         self.idle_pose_timer.timeout.connect(self.update_idle_pose)
         self.idle_pose_timer.start(1500)
 
+        self.reset_inactivity_timer()
         QTimer.singleShot(
             500,
-            lambda: self.show_message("Hi! I'm RoboMate 👋", duration=5000)
+            self.show_startup_greeting
         )
+
+    def reset_inactivity_timer(self):
+        self.inactivity_timer.start(20000)
+
+    def register_interaction(self):
+        self.reset_inactivity_timer()
+
+        if not self.is_sleepy:
+            return
+
+        self.is_sleepy = False
+        self.expression = "normal"
+        self.eyes_closed = False
+        self.float_direction = 1
+        self.show_message("Hey! You're back 👋", duration=3000)
+        self.update()
+
+        if self.roaming_enabled:
+            self.start_roaming_walk()
+
+    def enter_sleepy_state(self):
+        if self.is_sleepy:
+            return
+
+        self.is_sleepy = True
+        self.expression = "sleepy"
+        self.idle_wait_timer.stop()
+        self.is_walking = False
+        self.walk_frame = 0
+        self.update()
+
+    def get_startup_greeting(self):
+        current_hour = datetime.now().hour
+
+        if 5 <= current_hour < 12:
+            return "Good morning! ☀️", "Ready to build something?"
+        if 12 <= current_hour < 17:
+            return "Good afternoon! 🤖", "Ready to continue?"
+        if 17 <= current_hour < 22:
+            return "Good evening! 🌙", "Let's get something done."
+        return "You're still up? 🌙", "I'm here if you want to keep going."
+
+    def show_startup_greeting(self):
+        first_message, second_message = self.get_startup_greeting()
+        self.show_message(first_message, duration=2000)
+        self.start_wave()
+        QTimer.singleShot(
+            2000,
+            lambda: self.show_message(second_message, duration=4000)
+        )
+        self.schedule_next_roam(7000)
+
+    def start_wave(self):
+        self.is_waving = True
+        self.wave_angle = 0
+        self.wave_direction = 1
+        self.wave_timer.start()
+        QTimer.singleShot(1800, self.stop_wave)
+        self.update()
+
+    def update_wave(self):
+        self.wave_angle += 5 * self.wave_direction
+
+        if self.wave_angle >= 15 or self.wave_angle <= -15:
+            self.wave_direction *= -1
+
+        self.update()
+
+    def stop_wave(self):
+        self.wave_timer.stop()
+        self.is_waving = False
+        self.wave_angle = 0
+        self.update()
 
     def show_message(self, text, duration=5000):
         self.message_id += 1
@@ -110,21 +191,53 @@ class RoboMateWindow(QWidget):
         if message_id == self.message_id:
             self.message_label.hide()
 
-    def toggle_walk(self):
+    def pause_roaming(self):
+        self.roaming_enabled = False
+        self.idle_wait_timer.stop()
+        self.is_walking = False
+        self.walk_frame = 0
+        self.update()
+
+    def resume_roaming(self):
         if self.roaming_enabled:
-            self.roaming_enabled = False
-            self.idle_wait_timer.stop()
-            self.is_walking = False
-            self.walk_frame = 0
-            self.walk_button.setText("Walk")
-            self.update()
+            if not self.is_walking and not self.idle_wait_timer.isActive():
+                self.start_roaming_walk()
             return
 
         self.roaming_enabled = True
-        self.start_roaming_walk()
+        if not self.is_sleepy:
+            self.start_roaming_walk()
+
+    def schedule_next_roam(self, delay):
+        self.idle_wait_timer.stop()
+        if self.roaming_enabled and not self.is_sleepy:
+            self.idle_wait_timer.start(delay)
+
+    def show_context_menu(self, global_position):
+        menu = QMenu(self)
+        pause_action = menu.addAction("Pause roaming")
+        resume_action = menu.addAction("Resume roaming")
+        menu.addSeparator()
+        hide_action = menu.addAction("Hide RoboMate")
+        close_action = menu.addAction("Close RoboMate")
+
+        selected_action = menu.exec(global_position)
+        if selected_action == pause_action:
+            self.pause_roaming()
+        elif selected_action == resume_action:
+            self.resume_roaming()
+        elif selected_action == hide_action:
+            self.hide()
+        elif selected_action == close_action:
+            QApplication.instance().quit()
 
     def start_roaming_walk(self):
         if not self.roaming_enabled:
+            return
+        if self.is_sleepy or self.is_walking:
+            return
+        if self.is_waving:
+            self.schedule_next_roam(100)
             return
 
         screen = QApplication.primaryScreen().availableGeometry()
@@ -134,7 +247,6 @@ class RoboMateWindow(QWidget):
         self.target_y = random.randint(screen.top(), max_y)
         self.is_walking = True
         self.walk_frame = 0
-        self.walk_button.setText("Stop")
         self.update()
 
     def update_walk(self):
@@ -154,7 +266,7 @@ class RoboMateWindow(QWidget):
             self.walk_frame = 0
             self.update()
             if self.roaming_enabled:
-                self.idle_wait_timer.start(random.randint(4000, 7000))
+                self.schedule_next_roam(random.randint(4000, 7000))
             return
 
         if abs(dx) >= abs(dy) and dx != 0:
@@ -174,12 +286,21 @@ class RoboMateWindow(QWidget):
         self.move(new_x, new_y)
 
     def update_idle_animation(self):
-        self.float_offset += self.float_direction
+        self.idle_animation_tick += 1
+        float_step = 1
+        float_limit = 5
 
-        if self.float_offset >= 5:
+        if self.is_sleepy:
+            float_limit = 1
+            if self.idle_animation_tick % 4 != 0:
+                float_step = 0
+
+        self.float_offset += self.float_direction * float_step
+
+        if self.float_offset >= float_limit:
             self.float_direction = -1
 
-        elif self.float_offset <= -5:
+        elif self.float_offset <= -float_limit:
             self.float_direction = 1
 
         # Ease toward each idle pose instead of snapping to it.
@@ -226,6 +347,9 @@ class RoboMateWindow(QWidget):
         self.update()
 
     def show_happy(self):
+        if self.is_sleepy:
+            return
+
         self.expression = "happy"
 
         self.show_message(
@@ -302,15 +426,35 @@ class RoboMateWindow(QWidget):
         painter.drawEllipse(157 + right_leg_x, 265 + right_leg_y, 51, 27)
 
         # Chubby little arms with round shoulders and small hands.
-        painter.drawRoundedRect(91, 207 + arm_y, 34, 23, 11, 11)
+        if self.is_waving:
+            painter.drawRoundedRect(103, 207 + arm_y, 22, 23, 11, 11)
+            painter.save()
+            painter.translate(105, 216 + arm_y)
+            painter.rotate(self.wave_angle)
+            painter.drawRoundedRect(-25, -11, 27, 23, 11, 11)
+            painter.drawEllipse(-25, -9, 23, 23)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#a6eaf5"))
+            painter.drawEllipse(-18, -3, 8, 8)
+            painter.restore()
+            painter.setPen(outline)
+            painter.setBrush(shell)
+            painter.drawEllipse(99, 198 + arm_y, 32, 32)
+        else:
+            painter.drawRoundedRect(91, 207 + arm_y, 34, 23, 11, 11)
+            painter.drawEllipse(99, 198 + arm_y, 32, 32)
+            painter.drawEllipse(80, 209 + arm_y, 23, 23)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#a6eaf5"))
+            painter.drawEllipse(87, 215 + arm_y, 8, 8)
+
+        painter.setPen(outline)
+        painter.setBrush(shell)
         painter.drawRoundedRect(195, 207 + arm_y, 34, 23, 11, 11)
-        painter.drawEllipse(99, 198 + arm_y, 32, 32)
         painter.drawEllipse(189, 198 + arm_y, 32, 32)
-        painter.drawEllipse(80, 209 + arm_y, 23, 23)
         painter.drawEllipse(217, 209 + arm_y, 23, 23)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#a6eaf5"))
-        painter.drawEllipse(87, 215 + arm_y, 8, 8)
         painter.drawEllipse(225, 215 + arm_y, 8, 8)
 
         # Scale the complete head, visor, and face together by 88%.
@@ -352,7 +496,13 @@ class RoboMateWindow(QWidget):
         painter.setBrush(QColor("#3beaff"))
         gaze_offset = self.gaze_offset
 
-        if self.expression == "happy":
+        if self.expression == "sleepy":
+            painter.setPen(QPen(QColor("#3beaff"), 3))
+            painter.drawLine(118 + gaze_offset, 130 + y, 137 + gaze_offset, 130 + y)
+            painter.drawLine(185 + gaze_offset, 130 + y, 204 + gaze_offset, 130 + y)
+            painter.setPen(QPen(QColor("#8beaff"), 2))
+            painter.drawText(218, 105 + y, "Zz")
+        elif self.expression == "happy":
             painter.setPen(QPen(QColor("#3beaff"), 5))
             painter.drawArc(111 + gaze_offset, 121 + y, 31, 22, 0, 180 * 16)
             painter.drawArc(178 + gaze_offset, 121 + y, 31, 22, 0, 180 * 16)
@@ -392,6 +542,13 @@ class RoboMateWindow(QWidget):
         painter.restore()
 
     def mousePressEvent(self, event):
+        self.register_interaction()
+
+        if event.button() == Qt.RightButton:
+            self.show_context_menu(event.globalPosition().toPoint())
+            event.accept()
+            return
+
         if event.button() == Qt.LeftButton:
 
             click_position = event.position()
@@ -410,6 +567,7 @@ class RoboMateWindow(QWidget):
 
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.LeftButton:
+            self.register_interaction()
 
             self.move(
                 event.globalPosition().toPoint()
