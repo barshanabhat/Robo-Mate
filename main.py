@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 import random
 from datetime import datetime
@@ -5,12 +7,29 @@ from math import hypot
 
 from PySide6.QtCore import Qt, QPoint, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor, QLinearGradient
-from PySide6.QtWidgets import QApplication, QLabel, QMenu, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QDialog,
+    QInputDialog,
+    QMenu,
+    QWidget
+)
+
+from database import RoboMateDatabase
+from chat_dialog import ChatDialog
 
 
 class RoboMateWindow(QWidget):
     def __init__(self):
         super().__init__()
+
+        self.database = RoboMateDatabase()
+        self.database.initialize_database()
+        self.current_project = self.database.get_latest_project()
+        self.chat_dialog = None
+
+        self.settings_file = "settings.json"
 
         self.walk_frame = 0
 
@@ -102,10 +121,49 @@ class RoboMateWindow(QWidget):
         self.idle_pose_timer.start(1500)
 
         self.reset_inactivity_timer()
+        self.load_settings()
         QTimer.singleShot(
             500,
             self.show_startup_greeting
         )
+
+    def load_settings(self):
+        if not os.path.exists(self.settings_file):
+            return
+
+        try:
+            with open(self.settings_file, "r") as file:
+                settings = json.load(file)
+
+            x = settings.get("x")
+            y = settings.get("y")
+
+            if x is not None and y is not None:
+                self.move(x, y)
+
+            roaming_enabled = settings.get("roaming_enabled", True)
+            self.roaming_enabled = roaming_enabled
+
+        except Exception as error:
+            print("Could not load settings:", error)
+
+    def save_settings(self):
+        settings = {
+            "x": self.x(),
+            "y": self.y(),
+            "roaming_enabled": self.roaming_enabled
+        }
+
+        try:
+            with open(self.settings_file, "w") as file:
+                json.dump(settings, file, indent=4)
+
+        except Exception as error:
+            print("Could not save settings:", error)
+
+    def closeEvent(self, event):
+        self.save_settings()
+        event.accept()
 
     def reset_inactivity_timer(self):
         self.inactivity_timer.start(20000)
@@ -156,7 +214,13 @@ class RoboMateWindow(QWidget):
             2000,
             lambda: self.show_message(second_message, duration=4000)
         )
+        QTimer.singleShot(6500, self.show_latest_project_message)
         self.schedule_next_roam(7000)
+
+    def show_latest_project_message(self):
+        if self.current_project is not None:
+            project_name = self.current_project[1]
+            self.show_message(f"Last project: {project_name}", duration=3000)
 
     def start_wave(self):
         self.is_waving = True
@@ -213,11 +277,102 @@ class RoboMateWindow(QWidget):
         if self.roaming_enabled and not self.is_sleepy:
             self.idle_wait_timer.start(delay)
 
+    def show_project_selector(self):
+        projects = self.database.get_projects()
+        if not projects:
+            self.show_message("No saved projects yet.")
+            return
+
+        menu = QMenu(self)
+        for project in projects:
+            action = menu.addAction(project[1])
+            action.setData(project[0])
+
+        selected_action = menu.exec(self.mapToGlobal(self.rect().center()))
+        if selected_action is None:
+            return
+
+        project_id = selected_action.data()
+        self.current_project = self.database.get_project_by_id(project_id)
+        if self.current_project is not None:
+            self.show_message(f"Working on: {self.current_project[1]}")
+
+    def ask_project_text(self, label):
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Add Project")
+        dialog.setLabelText(label)
+        dialog.setInputMode(QInputDialog.TextInput)
+        dialog.setWindowFlags(
+            Qt.Dialog |
+            Qt.WindowStaysOnTopHint
+        )
+        dialog.adjustSize()
+        dialog.move(
+            self.mapToGlobal(self.rect().center())
+            - dialog.rect().center()
+        )
+
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        return dialog.textValue(), accepted
+
+    def add_new_project(self):
+        project_name, accepted = self.ask_project_text("Project name:")
+        if not accepted:
+            return
+
+        project_name = project_name.strip()
+        if not project_name:
+            return
+
+        if self.database.get_project_by_name(project_name) is not None:
+            self.show_message("That project already exists.")
+            return
+
+        folder_path, accepted = self.ask_project_text("Project folder path:")
+        if not accepted:
+            return
+
+        description, accepted = self.ask_project_text("Description:")
+        if not accepted:
+            return
+
+        self.database.add_project(
+            name=project_name,
+            folder_path=folder_path.strip(),
+            description=description.strip()
+        )
+        self.current_project = self.database.get_project_by_name(project_name)
+        self.show_message(f"Project added: {project_name}")
+
+    def open_chat_dialog(self):
+        if self.chat_dialog is None:
+            self.chat_dialog = ChatDialog(
+                parent=self,
+                current_project=self.current_project
+            )
+            self.chat_dialog.setAttribute(Qt.WA_DeleteOnClose)
+            self.chat_dialog.destroyed.connect(
+                lambda: setattr(self, "chat_dialog", None)
+            )
+            self.chat_dialog.move(
+                self.mapToGlobal(self.rect().center())
+                - self.chat_dialog.rect().center()
+            )
+        else:
+            self.chat_dialog.current_project = self.current_project
+
+        self.chat_dialog.show()
+        self.chat_dialog.raise_()
+        self.chat_dialog.activateWindow()
+
     def show_context_menu(self, global_position):
         menu = QMenu(self)
         pause_action = menu.addAction("Pause roaming")
         resume_action = menu.addAction("Resume roaming")
         menu.addSeparator()
+        switch_project_action = menu.addAction("Switch Project")
+        add_project_action = menu.addAction("Add Project")
+        chat_action = menu.addAction("Chat with RoboMate")
         hide_action = menu.addAction("Hide RoboMate")
         close_action = menu.addAction("Close RoboMate")
 
@@ -226,10 +381,16 @@ class RoboMateWindow(QWidget):
             self.pause_roaming()
         elif selected_action == resume_action:
             self.resume_roaming()
+        elif selected_action == switch_project_action:
+            self.show_project_selector()
+        elif selected_action == add_project_action:
+            self.add_new_project()
+        elif selected_action == chat_action:
+            self.open_chat_dialog()
         elif selected_action == hide_action:
             self.hide()
         elif selected_action == close_action:
-            QApplication.instance().quit()
+            self.close()
 
     def start_roaming_walk(self):
         if not self.roaming_enabled:
