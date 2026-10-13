@@ -28,12 +28,17 @@ class RoboMateWindow(QWidget):
         self.database.initialize_database()
         self.current_project = self.database.get_latest_project()
         self.chat_dialog = None
+        self.is_shutting_down = False
 
         self.settings_file = "settings.json"
 
         self.walk_frame = 0
 
         self.drag_position = QPoint()
+        self.press_position = QPoint()
+        self.press_click_position = QPoint()
+        self.left_press_active = False
+        self.is_dragging = False
         self.eyes_closed = False
         self.expression = "normal"
         self.is_waving = False
@@ -165,8 +170,43 @@ class RoboMateWindow(QWidget):
         self.save_settings()
         event.accept()
 
+    def quit_robomate(self):
+        if self.is_shutting_down:
+            return
+
+        self.is_shutting_down = True
+        self.save_settings()
+
+        timer_names = (
+            "walk_timer",
+            "idle_wait_timer",
+            "wave_timer",
+            "inactivity_timer",
+            "blink_timer",
+            "idle_timer",
+            "idle_pose_timer"
+        )
+        for timer_name in timer_names:
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+
+        if self.chat_dialog is not None:
+            response_worker = self.chat_dialog.response_worker
+            if response_worker is not None and response_worker.isRunning():
+                response_worker.wait()
+
+            self.chat_dialog.close()
+            self.chat_dialog = None
+
+        self.close()
+
+        application = QApplication.instance()
+        if application is not None:
+            application.quit()
+
     def reset_inactivity_timer(self):
-        self.inactivity_timer.start(20000)
+        self.inactivity_timer.start(120000)
 
     def register_interaction(self):
         self.reset_inactivity_timer()
@@ -182,12 +222,14 @@ class RoboMateWindow(QWidget):
         self.update()
 
         if self.roaming_enabled:
+            print("Resuming roaming after wake-up")
             self.start_roaming_walk()
 
     def enter_sleepy_state(self):
         if self.is_sleepy:
             return
 
+        print("Entering sleepy state")
         self.is_sleepy = True
         self.expression = "sleepy"
         self.idle_wait_timer.stop()
@@ -215,12 +257,17 @@ class RoboMateWindow(QWidget):
             lambda: self.show_message(second_message, duration=4000)
         )
         QTimer.singleShot(6500, self.show_latest_project_message)
-        self.schedule_next_roam(7000)
+        print("Startup roaming scheduled")
+        QTimer.singleShot(6000, self.start_startup_roaming)
 
     def show_latest_project_message(self):
         if self.current_project is not None:
             project_name = self.current_project[1]
             self.show_message(f"Last project: {project_name}", duration=3000)
+
+    def start_startup_roaming(self):
+        if self.roaming_enabled:
+            self.start_roaming_walk()
 
     def start_wave(self):
         self.is_waving = True
@@ -256,6 +303,7 @@ class RoboMateWindow(QWidget):
             self.message_label.hide()
 
     def pause_roaming(self):
+        print("Pausing roaming")
         self.roaming_enabled = False
         self.idle_wait_timer.stop()
         self.is_walking = False
@@ -263,18 +311,16 @@ class RoboMateWindow(QWidget):
         self.update()
 
     def resume_roaming(self):
-        if self.roaming_enabled:
-            if not self.is_walking and not self.idle_wait_timer.isActive():
-                self.start_roaming_walk()
-            return
-
         self.roaming_enabled = True
+        self.idle_wait_timer.stop()
         if not self.is_sleepy:
+            print("Resuming roaming")
             self.start_roaming_walk()
 
     def schedule_next_roam(self, delay):
         self.idle_wait_timer.stop()
         if self.roaming_enabled and not self.is_sleepy:
+            print(f"Scheduling next roam in {delay} ms")
             self.idle_wait_timer.start(delay)
 
     def show_project_selector(self):
@@ -350,10 +396,6 @@ class RoboMateWindow(QWidget):
                 parent=self,
                 current_project=self.current_project
             )
-            self.chat_dialog.setAttribute(Qt.WA_DeleteOnClose)
-            self.chat_dialog.destroyed.connect(
-                lambda: setattr(self, "chat_dialog", None)
-            )
             self.chat_dialog.move(
                 self.mapToGlobal(self.rect().center())
                 - self.chat_dialog.rect().center()
@@ -367,30 +409,30 @@ class RoboMateWindow(QWidget):
 
     def show_context_menu(self, global_position):
         menu = QMenu(self)
-        pause_action = menu.addAction("Pause roaming")
-        resume_action = menu.addAction("Resume roaming")
+        if self.roaming_enabled:
+            roaming_action = menu.addAction("Pause roaming")
+        else:
+            roaming_action = menu.addAction("Resume roaming")
         menu.addSeparator()
         switch_project_action = menu.addAction("Switch Project")
         add_project_action = menu.addAction("Add Project")
-        chat_action = menu.addAction("Chat with RoboMate")
-        hide_action = menu.addAction("Hide RoboMate")
+        settings_action = menu.addAction("Settings")
         close_action = menu.addAction("Close RoboMate")
 
         selected_action = menu.exec(global_position)
-        if selected_action == pause_action:
-            self.pause_roaming()
-        elif selected_action == resume_action:
-            self.resume_roaming()
+        if selected_action == roaming_action:
+            if self.roaming_enabled:
+                self.pause_roaming()
+            else:
+                self.resume_roaming()
         elif selected_action == switch_project_action:
             self.show_project_selector()
         elif selected_action == add_project_action:
             self.add_new_project()
-        elif selected_action == chat_action:
-            self.open_chat_dialog()
-        elif selected_action == hide_action:
-            self.hide()
+        elif selected_action == settings_action:
+            self.show_message("Settings are coming soon.")
         elif selected_action == close_action:
-            self.close()
+            self.quit_robomate()
 
     def start_roaming_walk(self):
         if not self.roaming_enabled:
@@ -401,6 +443,8 @@ class RoboMateWindow(QWidget):
             self.schedule_next_roam(100)
             return
 
+        self.idle_wait_timer.stop()
+        print("Starting roam")
         screen = QApplication.primaryScreen().availableGeometry()
         max_x = screen.right() - self.width() + 1
         max_y = screen.bottom() - self.height() + 1
@@ -426,6 +470,7 @@ class RoboMateWindow(QWidget):
             self.is_walking = False
             self.walk_frame = 0
             self.update()
+            print("Reached target")
             if self.roaming_enabled:
                 self.schedule_next_roam(random.randint(4000, 7000))
             return
@@ -711,29 +756,48 @@ class RoboMateWindow(QWidget):
             return
 
         if event.button() == Qt.LeftButton:
-
-            click_position = event.position()
-
-            if (
-                95 <= click_position.x() <= 165
-                and
-                146 <= click_position.y() <= 198
-            ):
-                self.show_happy()
-
+            self.left_press_active = True
+            self.is_dragging = False
+            self.press_position = event.globalPosition().toPoint()
+            self.press_click_position = event.position().toPoint()
             self.drag_position = (
-                event.globalPosition().toPoint()
-                - self.frameGeometry().topLeft()
+                self.press_position - self.frameGeometry().topLeft()
             )
+            event.accept()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton:
+        if self.left_press_active and event.buttons() & Qt.LeftButton:
             self.register_interaction()
 
-            self.move(
-                event.globalPosition().toPoint()
-                - self.drag_position
-            )
+            current_position = event.globalPosition().toPoint()
+            movement = current_position - self.press_position
+            if (
+                not self.is_dragging
+                and movement.manhattanLength() >= QApplication.startDragDistance()
+            ):
+                self.is_dragging = True
+
+            if self.is_dragging:
+                self.move(current_position - self.drag_position)
+
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.left_press_active:
+            was_dragging = self.is_dragging
+            click_position = self.press_click_position
+            self.left_press_active = False
+            self.is_dragging = False
+
+            if not was_dragging:
+                if (
+                    95 <= click_position.x() <= 165
+                    and 146 <= click_position.y() <= 198
+                ):
+                    self.show_happy()
+                self.open_chat_dialog()
+
+            event.accept()
 
 
 app = QApplication(sys.argv)

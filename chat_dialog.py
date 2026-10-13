@@ -1,24 +1,53 @@
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout
 )
 
+from ai_provider import OllamaProvider
+
+
+class AIResponseWorker(QThread):
+    response_ready = Signal(str)
+    request_failed = Signal(str)
+
+    def __init__(self, provider, message, project_context, parent=None):
+        super().__init__(parent)
+        self.provider = provider
+        self.message = message
+        self.project_context = project_context
+
+    def run(self):
+        try:
+            response = self.provider.ask(
+                self.message,
+                self.project_context
+            )
+            self.response_ready.emit(response)
+        except Exception:
+            self.request_failed.emit(
+                "I couldn't reach the AI service. Please try again."
+            )
+
 
 class ChatDialog(QDialog):
-    def __init__(self, parent=None, current_project=None):
+    def __init__(self, parent=None, current_project=None, provider=None):
         super().__init__(parent)
         self.current_project = current_project
+        self.provider = provider or OllamaProvider()
+        self.response_worker = None
 
         self.setWindowTitle("Chat with RoboMate")
         self.setWindowFlags(
             Qt.Dialog |
             Qt.WindowStaysOnTopHint
         )
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.resize(380, 420)
 
         self.message_area = QPlainTextEdit()
@@ -33,13 +62,20 @@ class ChatDialog(QDialog):
             }
         """)
 
+        self.status_label = QLabel("RoboMate is thinking...")
+        self.status_label.hide()
+
         self.message_input = QLineEdit()
         self.message_input.setPlaceholderText("Type a message...")
         self.message_input.returnPressed.connect(self.send_message)
 
         self.send_button = QPushButton("Send")
+        self.send_button.setAutoDefault(False)
+        self.send_button.setDefault(False)
         self.send_button.clicked.connect(self.send_message)
         self.close_button = QPushButton("Close")
+        self.close_button.setAutoDefault(False)
+        self.close_button.setDefault(False)
         self.close_button.clicked.connect(self.close)
 
         input_layout = QHBoxLayout()
@@ -52,6 +88,7 @@ class ChatDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.message_area)
+        layout.addWidget(self.status_label)
         layout.addLayout(input_layout)
         layout.addLayout(button_layout)
         self.setStyleSheet("""
@@ -85,14 +122,31 @@ class ChatDialog(QDialog):
 
         self.message_area.appendPlainText(f"Me:\n{message}\n")
         self.message_input.clear()
+        self.send_button.setEnabled(False)
+        self.message_input.setEnabled(False)
+        self.status_label.show()
 
-        if self.current_project is not None:
-            project_name = self.current_project[1]
-            response = (
-                f"I heard you. Current project: {project_name}.\n"
-                "My AI brain is coming next! 🤖"
-            )
-        else:
-            response = "I heard you. My AI brain is coming next! 🤖"
+        self.response_worker = AIResponseWorker(
+            self.provider,
+            message,
+            self.current_project,
+            self
+        )
+        self.response_worker.response_ready.connect(self.show_response)
+        self.response_worker.request_failed.connect(self.show_error)
+        self.response_worker.finished.connect(self.finish_request)
+        self.response_worker.finished.connect(self.response_worker.deleteLater)
+        self.response_worker.start()
 
+    def show_response(self, response):
         self.message_area.appendPlainText(f"RoboMate:\n{response}\n")
+
+    def show_error(self, message):
+        self.message_area.appendPlainText(f"RoboMate:\n{message}\n")
+
+    def finish_request(self):
+        self.status_label.hide()
+        self.send_button.setEnabled(True)
+        self.message_input.setEnabled(True)
+        self.message_input.setFocus()
+        self.response_worker = None
