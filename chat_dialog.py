@@ -25,6 +25,7 @@ class SafeCommandWorker(QThread):
         command=None,
         operation="run",
         verification_passed=False,
+        project_context=None,
         parent=None
     ):
         super().__init__(parent)
@@ -32,6 +33,7 @@ class SafeCommandWorker(QThread):
         self.command = command
         self.operation = operation
         self.verification_passed = verification_passed
+        self.project_context = project_context
 
     def run(self):
         try:
@@ -48,6 +50,8 @@ class SafeCommandWorker(QThread):
                 output = runner.verify()
             elif self.operation == "workflow":
                 output = runner.workflow_status(self.verification_passed)
+            elif self.operation == "summary":
+                output = self._project_summary(runner)
             else:
                 output = runner.run(self.command)
         except FileNotFoundError:
@@ -63,6 +67,64 @@ class SafeCommandWorker(QThread):
         except OSError:
             output = "RoboMate could not run that command."
         self.command_finished.emit(output)
+
+    def _project_summary(self, runner):
+        project = self.project_context
+        project_name = self._project_field(project, 1)
+        project_folder = self._project_field(project, 2)
+        git = runner.git_summary()
+
+        try:
+            if not project_folder:
+                raise ValueError("The project folder is not available.")
+            reader = ProjectReader(project_folder)
+            relevant_file_count = len(reader.list_files())
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError, ValueError):
+            relevant_file_count = None
+
+        has_changes = git["changes"] == "Yes"
+        verified = (
+            has_changes
+            and self.verification_passed
+        )
+
+        lines = [
+            "Project Summary",
+            "",
+            f"Name: {project_name}",
+            f"Folder: {project_folder or 'Not available'}",
+            f"Description: {self._project_field(project, 3)}",
+            f"Technologies: {self._project_field(project, 4)}",
+            "",
+            "Git:",
+            f"Repository: {git['repository']}",
+            f"Branch: {git['branch']}",
+            f"Upstream: {git['upstream']}",
+            f"Changes: {git['changes']}",
+            f"Ahead: {git['ahead']}",
+            f"Behind: {git['behind']}",
+            f"Latest commit: {git['latest_commit']}",
+            "",
+            "Files:",
+            (
+                f"Relevant files: {relevant_file_count}"
+                if relevant_file_count is not None
+                else "Relevant files: Not available"
+            ),
+            "",
+            "Verification:",
+            "Verified: Yes" if verified else "Not verified for current working state",
+            "",
+            f"Current task: {self._project_field(project, 5)}",
+            f"Next action: {self._project_field(project, 6)}"
+        ]
+        return runner._limit_output("\n".join(lines))
+
+    @staticmethod
+    def _project_field(project, index):
+        if project is None or len(project) <= index:
+            return "Not available"
+        return project[index] or "Not available"
 
 
 class AIResponseWorker(QThread):
@@ -259,6 +321,10 @@ class ChatDialog(QDialog):
         self.response_worker.start()
 
     def handle_terminal_command(self, message):
+        is_summary = (
+            message == "/summary"
+            or message.startswith("/summary ")
+        )
         is_workflow = (
             message == "/workflow"
             or message.startswith("/workflow ")
@@ -277,6 +343,7 @@ class ChatDialog(QDialog):
         is_push = message == "/push" or message.startswith("/push ")
         if (
             not is_run
+            and not is_summary
             and not is_workflow
             and not is_verify
             and not is_test
@@ -286,7 +353,13 @@ class ChatDialog(QDialog):
         ):
             return False
 
-        if is_workflow:
+        if is_summary:
+            if message != "/summary":
+                self.show_response("Usage: /summary")
+                return True
+            operation = "summary"
+            command = None
+        elif is_workflow:
             if message != "/workflow":
                 self.show_response("Usage: /workflow")
                 return True
@@ -373,6 +446,7 @@ class ChatDialog(QDialog):
             command,
             operation=operation,
             verification_passed=verification_passed,
+            project_context=self.current_project,
             parent=self
         )
         if operation == "run":

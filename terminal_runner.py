@@ -373,6 +373,99 @@ class SafeTerminalRunner:
         )
         return self._limit_output(report)
 
+    def git_summary(self):
+        def run_read_only_git(*arguments):
+            try:
+                return self._run_git(*arguments)
+            except (OSError, TimeoutError):
+                return None
+
+        repository = run_read_only_git(
+            "rev-parse",
+            "--is-inside-work-tree"
+        )
+        if (
+            repository is None
+            or repository.returncode
+            or repository.stdout.strip().lower() != "true"
+        ):
+            repo_message = (
+                ""
+                if repository is None
+                else (repository.stderr or repository.stdout).lower()
+            )
+            is_not_repository = "not a git repository" in repo_message
+            return {
+                "repository": (
+                    "No" if is_not_repository else "Unknown"
+                ),
+                "branch": "Not available",
+                "upstream": "Not configured",
+                "ahead": "Unknown",
+                "behind": "Unknown",
+                "changes": "Unknown",
+                "latest_commit": "Not available"
+            }
+
+        summary = {
+            "repository": "Yes",
+            "branch": "Unknown",
+            "upstream": "Not configured",
+            "ahead": "Unknown",
+            "behind": "Unknown",
+            "changes": "Unknown",
+            "latest_commit": "Not available"
+        }
+
+        branch = run_read_only_git("branch", "--show-current")
+        if branch is not None and branch.returncode == 0 and branch.stdout.strip():
+            summary["branch"] = branch.stdout.strip()
+
+        status = run_read_only_git("status", "--short")
+        if status is not None and status.returncode == 0:
+            summary["changes"] = (
+                "Yes" if status.stdout.strip() else "No"
+            )
+
+        upstream = run_read_only_git(
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}"
+        )
+        if (
+            upstream is not None
+            and upstream.returncode == 0
+            and upstream.stdout.strip()
+        ):
+            summary["upstream"] = upstream.stdout.strip()
+            divergence = run_read_only_git(
+                "rev-list",
+                "--left-right",
+                "--count",
+                "HEAD...@{u}"
+            )
+            if divergence is not None and divergence.returncode == 0:
+                counts = divergence.stdout.split()
+                if len(counts) == 2:
+                    try:
+                        ahead, behind = map(int, counts)
+                        if ahead >= 0 and behind >= 0:
+                            summary["ahead"] = str(ahead)
+                            summary["behind"] = str(behind)
+                    except ValueError:
+                        pass
+
+        latest_commit = run_read_only_git("log", "-1", "--oneline")
+        if (
+            latest_commit is not None
+            and latest_commit.returncode == 0
+            and latest_commit.stdout.strip()
+        ):
+            summary["latest_commit"] = latest_commit.stdout.strip()
+
+        return summary
+
     @classmethod
     def validate_commit_message(cls, message):
         if not isinstance(message, str) or not message.strip():
