@@ -1,4 +1,5 @@
 import difflib
+import sqlite3
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -189,6 +190,7 @@ class ChatDialog(QDialog):
     def __init__(self, parent=None, current_project=None, provider=None):
         super().__init__(parent)
         self.current_project = current_project
+        self.database = getattr(parent, "database", None)
         self.provider = provider or OllamaProvider()
         self.response_worker = None
         self.generating_edit = None
@@ -274,10 +276,19 @@ class ChatDialog(QDialog):
         if not message:
             return
 
+        if (
+            self.parent() is not None
+            and hasattr(self.parent(), "current_project")
+        ):
+            self.current_project = self.parent().current_project
+
         self.message_area.appendPlainText(f"Me:\n{message}\n")
         self.message_input.clear()
 
         if self.handle_local_project_command(message):
+            return
+
+        if self.handle_project_memory_command(message):
             return
 
         if self.handle_terminal_command(message):
@@ -301,6 +312,66 @@ class ChatDialog(QDialog):
             return
 
         self.start_ai_request(message, file_analysis)
+
+    def handle_project_memory_command(self, message):
+        if message == "/task" or message.startswith("/task "):
+            field = "task"
+            command = "/task"
+        elif message == "/next" or message.startswith("/next "):
+            field = "next"
+            command = "/next"
+        else:
+            return False
+
+        value = message[len(command):].strip()
+        if not value:
+            self.show_response(f"Usage: {command} <text> or {command} clear")
+            return True
+        if len(value) > 500:
+            self.show_response("Task and next-action text must be 500 characters or fewer.")
+            return True
+
+        project = self.current_project
+        if project is None:
+            self.show_response("Select a project first.")
+            return True
+        if self.database is None:
+            self.show_response("Project memory is not available right now.")
+            return True
+
+        stored_value = "" if value.casefold() == "clear" else value
+        try:
+            if field == "task":
+                self.database.update_project_task(project[0], stored_value)
+            else:
+                self.database.update_project_next_action(
+                    project[0],
+                    stored_value
+                )
+            self.current_project = self.database.get_project_by_id(project[0])
+            if (
+                self.parent() is not None
+                and hasattr(self.parent(), "current_project")
+            ):
+                self.parent().current_project = self.current_project
+        except LookupError as error:
+            self.show_response(str(error))
+            return True
+        except (sqlite3.Error, OSError, ValueError):
+            self.show_response("RoboMate could not update this project's memory.")
+            return True
+
+        if self.current_project is None:
+            self.show_response("The selected project could not be reloaded.")
+            return True
+
+        label = "Current task" if field == "task" else "Next action"
+        if stored_value:
+            response = f"{label} updated:\n{stored_value}"
+        else:
+            response = f"{label} cleared."
+        self.show_response(response)
+        return True
 
     def start_ai_request(self, message, file_analysis=None):
         self.send_button.setEnabled(False)

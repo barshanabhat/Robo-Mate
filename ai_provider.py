@@ -13,7 +13,13 @@ class OllamaProvider:
             "You are RoboMate, a local coding companion.\n"
             "Help the user understand, write, and debug software.\n"
             "Explain clearly because the user is still learning.\n"
+            "When a project is selected, you are helping with the user's "
+            "currently selected software project.\n"
+            "Use the provided project context when relevant.\n"
+            "Do not pretend you have read project files unless they were "
+            "explicitly provided through file tools.\n"
             "Do not claim you changed files.\n"
+            "Do not claim you ran commands unless a real RoboMate tool did so.\n"
             "Do not invent missing files. If the answer is uncertain, say so."
         )
 
@@ -28,6 +34,7 @@ class OllamaProvider:
             system_message += (
                 "\n\nCurrent project:"
                 f"\nName: {project_context[1]}"
+                f"\nFolder: {project_context[2] or ''}"
                 f"\nDescription: {project_context[3] or ''}"
                 f"\nTechnologies: {project_context[4] or ''}"
                 f"\nCurrent task: {project_context[5] or ''}"

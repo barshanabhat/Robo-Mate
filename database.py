@@ -100,6 +100,38 @@ class RoboMateDatabase:
         finally:
             connection.close()
 
+    def update_project_task(self, project_id, task):
+        return self._update_project_field(
+            project_id,
+            "current_task",
+            task
+        )
+
+    def update_project_next_action(self, project_id, next_action):
+        return self._update_project_field(
+            project_id,
+            "next_action",
+            next_action
+        )
+
+    def _update_project_field(self, project_id, field, value):
+        if field not in {"current_task", "next_action"}:
+            raise ValueError("Unsupported project field.")
+
+        connection = sqlite3.connect(self.database_file)
+        try:
+            cursor = connection.execute(
+                f"UPDATE projects SET {field} = ?, updated_at = ? "
+                "WHERE id = ?",
+                (value, datetime.now().isoformat(), project_id)
+            )
+            if cursor.rowcount == 0:
+                raise LookupError("The selected project no longer exists.")
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
 
 if __name__ == "__main__":
     database = RoboMateDatabase()
