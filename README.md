@@ -49,7 +49,7 @@ The technology stack may evolve as development progresses.
 - [ ] Implement persistent project memory.
 - [ ] Add voice input and spoken responses.
 - [ ] Add Windows startup settings.
-- [ ] Implement testing, backups, and safety controls.
+- [ ] Implement testing and safety controls.
 
 ## 🚀 Getting Started
 

@@ -19,20 +19,30 @@ from terminal_runner import CommandNotAllowedError, SafeTerminalRunner
 class SafeCommandWorker(QThread):
     command_finished = Signal(str)
 
-    def __init__(self, project_folder, command, parent=None):
+    def __init__(self, project_folder, command=None, operation="run", parent=None):
         super().__init__(parent)
         self.project_folder = project_folder
         self.command = command
+        self.operation = operation
 
     def run(self):
         try:
             runner = SafeTerminalRunner(self.project_folder)
-            output = runner.run(self.command)
+            if self.operation == "checkpoint":
+                output = runner.checkpoint(self.command)
+            elif self.operation == "git_status":
+                output = runner.git_status()
+            else:
+                output = runner.run(self.command)
         except FileNotFoundError:
             output = "The project folder or command executable was not found."
         except NotADirectoryError:
             output = "The selected project folder is not a directory."
         except PermissionError as error:
+            output = str(error)
+        except TimeoutError as error:
+            output = str(error)
+        except (RuntimeError, ValueError) as error:
             output = str(error)
         except OSError:
             output = "RoboMate could not run that command."
@@ -229,28 +239,54 @@ class ChatDialog(QDialog):
         self.response_worker.start()
 
     def handle_terminal_command(self, message):
-        if message != "/run" and not message.startswith("/run "):
+        is_run = message == "/run" or message.startswith("/run ")
+        is_git_status = (
+            message == "/gitstatus"
+            or message.startswith("/gitstatus ")
+        )
+        is_checkpoint = (
+            message == "/checkpoint"
+            or message.startswith("/checkpoint ")
+        )
+        if not is_run and not is_git_status and not is_checkpoint:
             return False
 
-        command = message[len("/run"):].strip()
-        if not command:
-            self.show_response(
-                "Usage: /run command\n"
-                "Allowed commands include: python --version, "
-                "python -m pytest, pytest, npm test, npm run test, "
-                "npm run build, npm run lint, git status, git diff, "
-                "git log --oneline -5"
-            )
-            return True
-
-        try:
-            SafeTerminalRunner.validate_command(command)
-        except CommandNotAllowedError as error:
-            self.show_response(f"Command not allowed: {error}")
-            return True
+        if is_run:
+            operation = "run"
+            command = message[len("/run"):].strip()
+            if not command:
+                self.show_response(
+                    "Usage: /run command\n"
+                    "Allowed commands include: python --version, "
+                    "python -m pytest, pytest, npm test, npm run test, "
+                    "npm run build, npm run lint, git status, git diff, "
+                    "git log --oneline -5"
+                )
+                return True
+            try:
+                SafeTerminalRunner.validate_command(command)
+            except CommandNotAllowedError as error:
+                self.show_response(f"Command not allowed: {error}")
+                return True
+        elif is_git_status:
+            if message != "/gitstatus":
+                self.show_response("Usage: /gitstatus")
+                return True
+            operation = "git_status"
+            command = None
+        else:
+            operation = "checkpoint"
+            command = message[len("/checkpoint"):].strip()
+            try:
+                command = SafeTerminalRunner.validate_commit_message(command)
+            except ValueError as error:
+                self.show_response(f"Checkpoint not allowed: {error}")
+                return True
 
         if self.current_project is None:
-            self.show_response("Select a project with a valid folder first.")
+            self.show_response(
+                "Select a project with a valid folder first."
+            )
             return True
 
         project_folder = self.current_project[2]
@@ -265,13 +301,17 @@ class ChatDialog(QDialog):
         self.response_worker = SafeCommandWorker(
             project_folder,
             command,
-            self
+            operation=operation,
+            parent=self
         )
-        self.response_worker.command_finished.connect(
-            lambda output: self.show_response(
-                f"Command output:\n{output}"
+        if operation == "run":
+            self.response_worker.command_finished.connect(
+                lambda output: self.show_response(
+                    f"Command output:\n{output}"
+                )
             )
-        )
+        else:
+            self.response_worker.command_finished.connect(self.show_response)
         self.response_worker.finished.connect(self.finish_request)
         self.response_worker.finished.connect(self.response_worker.deleteLater)
         self.response_worker.start()
