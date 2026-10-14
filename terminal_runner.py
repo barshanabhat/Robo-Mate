@@ -198,3 +198,60 @@ class SafeTerminalRunner:
         if not output:
             output = "Commit completed successfully."
         return self._limit_output(f"Checkpoint created:\n{output}")
+
+    def push(self):
+        self._ensure_git_repository()
+
+        branch = self._run_git("branch", "--show-current")
+        if branch.returncode:
+            raise RuntimeError(self._git_error(branch))
+        branch_name = branch.stdout.strip()
+        if not branch_name:
+            return "Cannot push while HEAD is detached."
+
+        upstream = self._run_git(
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}"
+        )
+        if upstream.returncode or not upstream.stdout.strip():
+            return "This branch has no upstream remote yet."
+
+        upstream_details = self._run_git(
+            "for-each-ref",
+            "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+            f"refs/heads/{branch_name}"
+        )
+        if upstream_details.returncode:
+            raise RuntimeError(self._git_error(upstream_details))
+
+        details = upstream_details.stdout.strip().split("\0", 1)
+        if (
+            len(details) != 2
+            or not details[0]
+            or details[0] == "."
+            or not details[1].startswith("refs/heads/")
+        ):
+            return "This branch has no upstream remote yet."
+        remote_name, remote_branch = details
+
+        status = self._run_git("status", "--short")
+        if status.returncode:
+            raise RuntimeError(self._git_error(status))
+        if status.stdout.strip():
+            return "You have uncommitted changes. Create a checkpoint first."
+
+        result = self._run_git(
+            "push",
+            "--",
+            remote_name,
+            f"HEAD:{remote_branch}"
+        )
+        if result.returncode:
+            raise RuntimeError(self._git_error(result))
+
+        output = (result.stdout + result.stderr).strip()
+        if not output:
+            output = "Push completed successfully."
+        return self._limit_output(output)

@@ -32,6 +32,8 @@ class SafeCommandWorker(QThread):
                 output = runner.checkpoint(self.command)
             elif self.operation == "git_status":
                 output = runner.git_status()
+            elif self.operation == "push":
+                output = runner.push()
             else:
                 output = runner.run(self.command)
         except FileNotFoundError:
@@ -248,7 +250,13 @@ class ChatDialog(QDialog):
             message == "/checkpoint"
             or message.startswith("/checkpoint ")
         )
-        if not is_run and not is_git_status and not is_checkpoint:
+        is_push = message == "/push" or message.startswith("/push ")
+        if (
+            not is_run
+            and not is_git_status
+            and not is_checkpoint
+            and not is_push
+        ):
             return False
 
         if is_run:
@@ -274,7 +282,7 @@ class ChatDialog(QDialog):
                 return True
             operation = "git_status"
             command = None
-        else:
+        elif is_checkpoint:
             operation = "checkpoint"
             command = message[len("/checkpoint"):].strip()
             try:
@@ -282,6 +290,12 @@ class ChatDialog(QDialog):
             except ValueError as error:
                 self.show_response(f"Checkpoint not allowed: {error}")
                 return True
+        elif is_push:
+            if message != "/push":
+                self.show_response("Usage: /push")
+                return True
+            operation = "push"
+            command = None
 
         if self.current_project is None:
             self.show_response(
