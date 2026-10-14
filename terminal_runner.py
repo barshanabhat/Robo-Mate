@@ -14,6 +14,11 @@ class SafeTerminalRunner:
     ALLOWED_COMMANDS = {
         "python --version": ("python", "--version"),
         "python -m pytest": ("python", "-m", "pytest"),
+        r".venv\scripts\python.exe -m pytest": (
+            r".venv\Scripts\python.exe",
+            "-m",
+            "pytest"
+        ),
         "pytest": ("pytest",),
         "npm test": ("npm", "test"),
         "npm run test": ("npm", "run", "test"),
@@ -25,6 +30,7 @@ class SafeTerminalRunner:
     }
 
     BLOCKED_OPERATORS = ("&", "|", ";", ">", "<", "`", "$")
+    PYTHON_VENV_TEST_COMMAND = r".venv\Scripts\python.exe -m pytest"
 
     def __init__(self, project_folder):
         self.project_folder = Path(project_folder).expanduser().resolve(
@@ -71,18 +77,7 @@ class SafeTerminalRunner:
     def run(self, command):
         arguments = self.validate_command(command)
         try:
-            result = subprocess.run(
-                arguments,
-                cwd=self.project_folder,
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.TIMEOUT_SECONDS,
-                check=False
-            )
+            result = self._run_arguments(arguments, cwd=self.project_folder)
         except subprocess.TimeoutExpired as error:
             output = (
                 self._decode_output(error.stdout)
@@ -113,6 +108,270 @@ class SafeTerminalRunner:
                 f"{output}"
             )
         return self._limit_output(output)
+
+    @classmethod
+    def _run_arguments(cls, arguments, cwd=None):
+        return subprocess.run(
+            arguments,
+            cwd=cwd,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=cls.TIMEOUT_SECONDS,
+            check=False
+        )
+
+    def detect_test_command(self):
+        root_files = {
+            path.name.lower()
+            for path in self.project_folder.iterdir()
+            if path.is_file()
+        }
+        has_python = bool(
+            root_files.intersection({
+                "pyproject.toml",
+                "pytest.ini",
+                "setup.cfg",
+                "requirements.txt"
+            })
+            or any(name.endswith(".py") for name in root_files)
+        )
+        if has_python:
+            venv_python = (
+                self.project_folder
+                / ".venv"
+                / "Scripts"
+                / "python.exe"
+            )
+            command = (
+                self.PYTHON_VENV_TEST_COMMAND
+                if venv_python.is_file()
+                else "python -m pytest"
+            )
+        elif "package.json" in root_files:
+            command = "npm test"
+        else:
+            return None
+
+        self.validate_command(command)
+        return command
+
+    def run_tests(self):
+        command, result = self._execute_tests()
+        if command is None:
+            return "I couldn't find a supported test command for this project."
+
+        if isinstance(result, subprocess.TimeoutExpired):
+            stdout = self._decode_output(result.stdout).strip() or "(no output)"
+            stderr = self._decode_output(result.stderr).strip() or "(no output)"
+            output = (
+                f"Test command:\n{command}\n\n"
+                "Exit code: unavailable (timed out)\n\n"
+                "Tests timed out.\n\n"
+                f"stdout:\n{stdout}\n\n"
+                f"stderr:\n{stderr}"
+            )
+            return self._limit_output(output)
+
+        stdout = result.stdout.strip() or "(no output)"
+        stderr = result.stderr.strip() or "(no output)"
+        missing_venv_pytest = (
+            command == self.PYTHON_VENV_TEST_COMMAND
+            and result.returncode != 0
+            and "no module named" in stderr.lower()
+            and "pytest" in stderr.lower()
+        )
+        if result.returncode == 0:
+            status = "Tests passed."
+        elif missing_venv_pytest:
+            status = (
+                "Pytest is not installed in this project's Python environment."
+            )
+        else:
+            status = "Tests failed."
+        output = (
+            f"Test command:\n{command}\n\n"
+            f"Exit code: {result.returncode}\n\n"
+            f"{status}\n\n"
+            f"stdout:\n{stdout}\n\n"
+            f"stderr:\n{stderr}"
+        )
+        return self._limit_output(output)
+
+    def _execute_tests(self):
+        command = self.detect_test_command()
+        if command is None:
+            return None, None
+
+        arguments = self.validate_command(command)
+        try:
+            result = self._run_arguments(arguments, cwd=self.project_folder)
+        except subprocess.TimeoutExpired as error:
+            return command, error
+        return command, result
+
+    def verify(self):
+        diff_stat = self._run_git("diff", "--stat")
+        if diff_stat.returncode:
+            raise RuntimeError(self._git_error(diff_stat))
+
+        diff = self._run_git("diff")
+        if diff.returncode:
+            raise RuntimeError(self._git_error(diff))
+        if not diff.stdout.strip():
+            return "No uncommitted code changes to verify."
+
+        command, test_result = self._execute_tests()
+        if command is None:
+            test_report = (
+                "I couldn't find a supported test command for this project."
+            )
+            passed = False
+        elif isinstance(test_result, subprocess.TimeoutExpired):
+            stdout = self._decode_output(test_result.stdout).strip() or "(no output)"
+            stderr = self._decode_output(test_result.stderr).strip() or "(no output)"
+            test_report = (
+                f"Test command: {command}\n"
+                "Exit code: unavailable (timed out)\n"
+                "Tests timed out.\n"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}"
+            )
+            passed = False
+        else:
+            stdout = test_result.stdout.strip() or "(no output)"
+            stderr = test_result.stderr.strip() or "(no output)"
+            test_report = (
+                f"Test command: {command}\n"
+                f"Exit code: {test_result.returncode}\n"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}"
+            )
+            passed = test_result.returncode == 0
+
+        result_message = (
+            "✅ Verification passed."
+            if passed
+            else (
+                "❌ Verification failed.\n"
+                "Review the test output before creating a checkpoint."
+            )
+        )
+        report = (
+            "Verification\n\n"
+            "Changed files:\n"
+            f"{diff_stat.stdout.strip() or '(no diff stat available)'}\n\n"
+            f"Tests:\n{test_report}\n\n"
+            f"Result:\n{result_message}"
+        )
+        return self._limit_output(report)
+
+    def workflow_status(self, verification_passed=False):
+        repository = self._run_git("rev-parse", "--is-inside-work-tree")
+        if (
+            repository.returncode
+            or repository.stdout.strip().lower() != "true"
+        ):
+            return (
+                "Workflow status:\n\n"
+                "Git repository: No\n"
+                "Changes: Unknown\n"
+                "Verified: No\n"
+                "Checkpoint: Unknown\n"
+                "Push: Unknown\n\n"
+                "Recommended next step:\n"
+                "Select a Git repository to use the safe Git workflow."
+            )
+
+        status = self._run_git("status", "--short")
+        if status.returncode:
+            raise RuntimeError(self._git_error(status))
+        has_changes = bool(status.stdout.strip())
+
+        upstream = self._run_git(
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}"
+        )
+        has_upstream = upstream.returncode == 0 and bool(
+            upstream.stdout.strip()
+        )
+        upstream_name = upstream.stdout.strip() if has_upstream else None
+        ahead_count = None
+        behind_count = None
+        if has_upstream:
+            divergence = self._run_git(
+                "rev-list",
+                "--left-right",
+                "--count",
+                "HEAD...@{u}"
+            )
+            if divergence.returncode:
+                raise RuntimeError(self._git_error(divergence))
+            try:
+                counts = divergence.stdout.split()
+                if len(counts) != 2:
+                    raise ValueError
+                ahead_count, behind_count = map(int, counts)
+                if ahead_count < 0 or behind_count < 0:
+                    raise ValueError
+            except ValueError as error:
+                raise RuntimeError(
+                    "Git returned invalid ahead/behind counts."
+                ) from error
+
+        verified = has_changes and verification_passed
+        if has_changes:
+            recommendation = (
+                "/checkpoint <commit message>"
+                if verified
+                else "/verify"
+            )
+            push_state = "Not ready"
+            checkpoint_state = "Not created"
+        elif behind_count is not None and behind_count > 0:
+            recommendation = (
+                "Remote has newer commits. Manual review is recommended "
+                "before pulling."
+            )
+            push_state = (
+                f"{ahead_count} local commit(s) pending"
+                if ahead_count
+                else "No local commits pending"
+            )
+            checkpoint_state = "No pending changes"
+        elif ahead_count is not None and ahead_count > 0:
+            recommendation = "/push"
+            push_state = f"{ahead_count} local commit(s) pending"
+            checkpoint_state = "Committed"
+        elif not has_upstream:
+            recommendation = (
+                "Configure an upstream remote before using /push."
+            )
+            push_state = "No upstream configured"
+            checkpoint_state = "No pending changes"
+        else:
+            recommendation = "Project is clean and up to date."
+            push_state = "Up to date"
+            checkpoint_state = "No pending changes"
+
+        report = (
+            "Workflow status:\n\n"
+            "Git repository: Yes\n"
+            f"Changes: {'Yes' if has_changes else 'No'}\n"
+            f"Verified: {'Yes' if verified else 'No'}\n"
+            f"Upstream: {upstream_name or 'Not configured'}\n"
+            f"Ahead: {ahead_count if ahead_count is not None else 'Unknown'}\n"
+            f"Behind: {behind_count if behind_count is not None else 'Unknown'}\n"
+            f"Checkpoint: {checkpoint_state}\n"
+            f"Push: {push_state}\n\n"
+            f"Recommended next step:\n{recommendation}"
+        )
+        return self._limit_output(report)
 
     @classmethod
     def validate_commit_message(cls, message):

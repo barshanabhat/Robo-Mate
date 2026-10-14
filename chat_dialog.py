@@ -19,11 +19,19 @@ from terminal_runner import CommandNotAllowedError, SafeTerminalRunner
 class SafeCommandWorker(QThread):
     command_finished = Signal(str)
 
-    def __init__(self, project_folder, command=None, operation="run", parent=None):
+    def __init__(
+        self,
+        project_folder,
+        command=None,
+        operation="run",
+        verification_passed=False,
+        parent=None
+    ):
         super().__init__(parent)
         self.project_folder = project_folder
         self.command = command
         self.operation = operation
+        self.verification_passed = verification_passed
 
     def run(self):
         try:
@@ -34,6 +42,12 @@ class SafeCommandWorker(QThread):
                 output = runner.git_status()
             elif self.operation == "push":
                 output = runner.push()
+            elif self.operation == "test":
+                output = runner.run_tests()
+            elif self.operation == "verify":
+                output = runner.verify()
+            elif self.operation == "workflow":
+                output = runner.workflow_status(self.verification_passed)
             else:
                 output = runner.run(self.command)
         except FileNotFoundError:
@@ -78,7 +92,7 @@ class AIResponseWorker(QThread):
                 )
             else:
                 command, file_path, file_content, request = self.file_analysis
-                if command == "edit":
+                if command in ("edit", "fix"):
                     response = self.provider.generate_updated_file(
                         file_path,
                         file_content,
@@ -117,6 +131,8 @@ class ChatDialog(QDialog):
         self.response_worker = None
         self.generating_edit = None
         self.pending_edit = None
+        self.last_verification_passed = False
+        self.verified_project_folder = None
 
         self.setWindowTitle("Chat with RoboMate")
         self.setWindowFlags(
@@ -209,6 +225,8 @@ class ChatDialog(QDialog):
             return
 
         file_edit = self.prepare_file_edit(message)
+        if file_edit is None:
+            file_edit = self.prepare_file_fix(message)
         if file_edit is False:
             return
         if file_edit is not None:
@@ -241,6 +259,12 @@ class ChatDialog(QDialog):
         self.response_worker.start()
 
     def handle_terminal_command(self, message):
+        is_workflow = (
+            message == "/workflow"
+            or message.startswith("/workflow ")
+        )
+        is_verify = message == "/verify" or message.startswith("/verify ")
+        is_test = message == "/test" or message.startswith("/test ")
         is_run = message == "/run" or message.startswith("/run ")
         is_git_status = (
             message == "/gitstatus"
@@ -253,13 +277,34 @@ class ChatDialog(QDialog):
         is_push = message == "/push" or message.startswith("/push ")
         if (
             not is_run
+            and not is_workflow
+            and not is_verify
+            and not is_test
             and not is_git_status
             and not is_checkpoint
             and not is_push
         ):
             return False
 
-        if is_run:
+        if is_workflow:
+            if message != "/workflow":
+                self.show_response("Usage: /workflow")
+                return True
+            operation = "workflow"
+            command = None
+        elif is_verify:
+            if message != "/verify":
+                self.show_response("Usage: /verify")
+                return True
+            operation = "verify"
+            command = None
+        elif is_test:
+            if message != "/test":
+                self.show_response("Usage: /test")
+                return True
+            operation = "test"
+            command = None
+        elif is_run:
             operation = "run"
             command = message[len("/run"):].strip()
             if not command:
@@ -308,6 +353,17 @@ class ChatDialog(QDialog):
             self.show_response("The selected project has no folder path.")
             return True
 
+        project_folder_key = str(project_folder).casefold()
+        if operation == "verify":
+            self.last_verification_passed = False
+            self.verified_project_folder = project_folder_key
+        elif operation in ("run", "test", "checkpoint", "push"):
+            self.invalidate_verification()
+        verification_passed = (
+            self.last_verification_passed
+            and self.verified_project_folder == project_folder_key
+        )
+
         self.send_button.setEnabled(False)
         self.message_input.setEnabled(False)
         self.status_label.setText("RoboMate is running the command...")
@@ -316,12 +372,20 @@ class ChatDialog(QDialog):
             project_folder,
             command,
             operation=operation,
+            verification_passed=verification_passed,
             parent=self
         )
         if operation == "run":
             self.response_worker.command_finished.connect(
                 lambda output: self.show_response(
                     f"Command output:\n{output}"
+                )
+            )
+        elif operation == "verify":
+            self.response_worker.command_finished.connect(
+                lambda output: self.handle_verification_response(
+                    output,
+                    project_folder_key
                 )
             )
         else:
@@ -331,21 +395,42 @@ class ChatDialog(QDialog):
         self.response_worker.start()
         return True
 
+    def handle_verification_response(self, output, project_folder_key):
+        self.last_verification_passed = (
+            "✅ Verification passed." in output
+        )
+        self.verified_project_folder = (
+            project_folder_key if self.last_verification_passed else None
+        )
+        self.show_response(output)
+
     def prepare_file_edit(self, message):
-        if message != "/edit" and not message.startswith("/edit "):
+        return self.prepare_file_change(message, "edit")
+
+    def prepare_file_fix(self, message):
+        return self.prepare_file_change(message, "fix")
+
+    def prepare_file_change(self, message, command):
+        command_prefix = f"/{command}"
+        if message != command_prefix and not message.startswith(
+            f"{command_prefix} "
+        ):
             return None
 
+        self.invalidate_verification()
         if self.pending_edit is not None or self.generating_edit is not None:
             self.show_response(
-                "There is already a pending edit. Type /approve or /cancel "
+                "There is already a pending change. Type /approve or /cancel "
                 "before requesting another."
             )
             return False
 
-        command_text = message[len("/edit"):].strip()
+        command_text = message[len(command_prefix):].strip()
         if "|" not in command_text:
+            request_name = "issue description" if command == "fix" else "requested change"
             self.show_response(
-                "Usage: /edit relative/path/to/file | requested change"
+                f"Usage: {command_prefix} relative/path/to/file | "
+                f"{request_name}"
             )
             return False
 
@@ -354,7 +439,8 @@ class ChatDialog(QDialog):
         request = request.strip()
         if not relative_path or not request:
             self.show_response(
-                "Usage: /edit relative/path/to/file | requested change"
+                f"Usage: {command_prefix} relative/path/to/file | "
+                f"{'issue description' if command == 'fix' else 'requested change'}"
             )
             return False
         if self.current_project is None:
@@ -391,10 +477,11 @@ class ChatDialog(QDialog):
         return {
             "file_path": relative_path,
             "request": request,
+            "kind": command,
             "original_content": original_content,
             "project_folder": project_folder,
             "worker_data": (
-                "edit",
+                command,
                 relative_path,
                 original_content,
                 request
@@ -472,8 +559,8 @@ class ChatDialog(QDialog):
             self.show_response(
                 "I couldn't prepare a safe full-file update. "
                 "The response was empty, explanatory, an error, or exceeded "
-                "the 200 KB limit. "
-                "No files were modified. Please try /edit again."
+                "the 200 KB limit. No files were modified. Please try "
+                f"/{edit['kind']} again."
             )
             return
 
@@ -489,19 +576,31 @@ class ChatDialog(QDialog):
         self.pending_edit = {
             "file_path": edit["file_path"],
             "request": edit["request"],
+            "kind": edit["kind"],
             "original_content": edit["original_content"],
             "new_content": updated_content,
             "project_folder": edit["project_folder"]
         }
-        self.show_response(
-            f"Edit preview for: {edit['file_path']}\n"
-            f"Requested change: {edit['request']}\n"
-            "Summary: A complete-file update was generated for this request.\n"
-            "No files are changed until you approve the update.\n\n"
-            f"Proposed diff:\n{proposed_diff or 'No text changes were generated.'}\n\n"
-            "Type /approve to apply this change\n"
-            "Type /cancel to discard it"
-        )
+        if edit["kind"] == "fix":
+            preview = (
+                f"Fix prepared for {edit['file_path']}.\n"
+                f"Issue: {edit['request']}\n"
+                "\n"
+                f"Proposed diff:\n{proposed_diff or 'No text changes were generated.'}\n\n"
+                "Type /approve to apply this fix\n"
+                "Type /cancel to discard it"
+            )
+        else:
+            preview = (
+                f"Edit preview for: {edit['file_path']}\n"
+                f"Requested change: {edit['request']}\n"
+                "Summary: A complete-file update was generated for this request.\n"
+                "No files are changed until you approve the update.\n\n"
+                f"Proposed diff:\n{proposed_diff or 'No text changes were generated.'}\n\n"
+                "Type /approve to apply this change\n"
+                "Type /cancel to discard it"
+            )
+        self.show_response(preview)
 
     def approve_pending_edit(self):
         if self.pending_edit is None:
@@ -509,6 +608,7 @@ class ChatDialog(QDialog):
             return
 
         edit = self.pending_edit
+        self.invalidate_verification()
         try:
             reader = ProjectReader(edit["project_folder"])
             reader.write_file(
@@ -541,6 +641,10 @@ class ChatDialog(QDialog):
         self.show_response(
             f"✅ {edit['file_path']} updated successfully."
         )
+
+    def invalidate_verification(self):
+        self.last_verification_passed = False
+        self.verified_project_folder = None
 
     def undo_last_edit(self):
         self.show_response(
