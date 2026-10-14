@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 __pycache__/chat_dialog.cpython-313.pyc
+settings.json
+robomate.db
