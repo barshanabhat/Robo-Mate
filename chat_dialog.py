@@ -1,4 +1,5 @@
 import difflib
+import re
 import sqlite3
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -138,21 +139,30 @@ class AIResponseWorker(QThread):
         message,
         project_context,
         file_analysis=None,
-        parent=None
+        parent=None,
+        code_context=None
     ):
         super().__init__(parent)
         self.provider = provider
         self.message = message
         self.project_context = project_context
         self.file_analysis = file_analysis
+        self.code_context = code_context
 
     def run(self):
         try:
             if self.file_analysis is None:
-                response = self.provider.ask(
-                    self.message,
-                    self.project_context
-                )
+                if self.code_context:
+                    response = self.provider.ask(
+                        self.message,
+                        self.project_context,
+                        code_context=self.code_context
+                    )
+                else:
+                    response = self.provider.ask(
+                        self.message,
+                        self.project_context
+                    )
             else:
                 command, file_path, file_content, request = self.file_analysis
                 if command in ("edit", "fix"):
@@ -197,6 +207,7 @@ class ChatDialog(QDialog):
         self.pending_edit = None
         self.last_verification_passed = False
         self.verified_project_folder = None
+        self.last_code_context = None
 
         self.setWindowTitle("Chat with RoboMate")
         self.setWindowFlags(
@@ -280,7 +291,10 @@ class ChatDialog(QDialog):
             self.parent() is not None
             and hasattr(self.parent(), "current_project")
         ):
+            previous_project = self._project_identity(self.current_project)
             self.current_project = self.parent().current_project
+            if previous_project != self._project_identity(self.current_project):
+                self.last_code_context = None
 
         self.message_area.appendPlainText(f"Me:\n{message}\n")
         self.message_input.clear()
@@ -311,7 +325,14 @@ class ChatDialog(QDialog):
         if file_analysis is False:
             return
 
-        self.start_ai_request(message, file_analysis)
+        code_context = (
+            self.last_code_context
+            if file_analysis is None
+            else None
+        )
+        if code_context:
+            self.show_response("Using gathered project context...")
+        self.start_ai_request(message, file_analysis, code_context)
 
     def handle_project_memory_command(self, message):
         if message == "/task" or message.startswith("/task "):
@@ -373,7 +394,7 @@ class ChatDialog(QDialog):
         self.show_response(response)
         return True
 
-    def start_ai_request(self, message, file_analysis=None):
+    def start_ai_request(self, message, file_analysis=None, code_context=None):
         self.send_button.setEnabled(False)
         self.message_input.setEnabled(False)
         self.status_label.show()
@@ -383,7 +404,8 @@ class ChatDialog(QDialog):
             message,
             self.current_project,
             file_analysis,
-            self
+            self,
+            code_context
         )
         self.response_worker.response_ready.connect(self.handle_ai_response)
         self.response_worker.request_failed.connect(self.show_error)
@@ -783,6 +805,7 @@ class ChatDialog(QDialog):
             return
 
         self.pending_edit = None
+        self.last_code_context = None
         self.show_response(
             f"✅ {edit['file_path']} updated successfully."
         )
@@ -797,12 +820,32 @@ class ChatDialog(QDialog):
         )
 
     def handle_local_project_command(self, message):
+        if message == "/clearcontext":
+            self.last_code_context = None
+            self.show_response("Code context cleared.")
+            return True
         if message == "/files":
             command = "files"
         elif message == "/read" or message.startswith("/read "):
             command = "read"
+        elif message == "/search" or message.startswith("/search "):
+            command = "search"
+        elif message == "/findcode" or message.startswith("/findcode "):
+            command = "findcode"
+        elif message == "/context" or message.startswith("/context "):
+            command = "context"
         else:
             return False
+
+        command_text = message[len(f"/{command}"):].strip()
+        if command == "context":
+            self.last_code_context = None
+        if command in ("search", "findcode") and not command_text:
+            self.show_response(f"Usage: /{command} <query>")
+            return True
+        if command == "context" and not command_text:
+            self.show_response("Usage: /context <question>")
+            return True
 
         if self.current_project is None:
             self.show_response("Select a project with a valid folder first.")
@@ -821,13 +864,46 @@ class ChatDialog(QDialog):
                     result = "Project files:\n\n" + "\n".join(files)
                 else:
                     result = "No readable project files were found."
-            else:
+            elif command == "read":
                 relative_path = message[len("/read"):].strip()
                 if not relative_path:
                     result = "Usage: /read relative/path/to/file"
                 else:
                     content = reader.read_file(relative_path)
                     result = f"File: {relative_path}\n\n{content}"
+            elif command == "search":
+                results = reader.search_files(command_text)
+                if not results:
+                    result = f'No matches found for "{command_text}".'
+                else:
+                    result = f'Search results for "{command_text}":\n'
+                    for index, item in enumerate(results, start=1):
+                        result += (
+                            f"\n{index}. {item['path']}\n"
+                            f"   matches: {', '.join(item['matches'])}"
+                        )
+            elif command == "findcode":
+                keywords = self._findcode_keywords(command_text)
+                if not keywords:
+                    result = (
+                        "I couldn't find useful search words in that question. "
+                        "Try /search <keyword>."
+                    )
+                else:
+                    result = self._format_findcode_results(reader, keywords)
+            else:
+                keywords = self._findcode_keywords(command_text)
+                if not keywords:
+                    result = (
+                        "I couldn't find useful search words in that question. "
+                        "Try /context <question> with specific project terms."
+                    )
+                else:
+                    self.last_code_context = self._gather_code_context(
+                        reader,
+                        keywords
+                    )
+                    result = self.last_code_context
             self.show_response(result)
         except FileNotFoundError:
             self.show_response("The project folder or requested file was not found.")
@@ -841,6 +917,259 @@ class ChatDialog(QDialog):
             self.show_response("RoboMate could not access that project file.")
 
         return True
+
+    @staticmethod
+    def _findcode_keywords(question):
+        stop_words = {
+            "a", "about", "and", "are", "code", "does", "find", "for",
+            "how", "implemented", "in", "is", "it", "of", "the", "this",
+            "to", "where", "which", "with"
+        }
+        keywords = []
+        for word in re.findall(r"[A-Za-z0-9_]+", question.casefold()):
+            if len(word) < 3 or word in stop_words or word in keywords:
+                continue
+            keywords.append(word)
+            if len(keywords) == 6:
+                break
+        return keywords
+
+    @staticmethod
+    def _format_findcode_results(reader, keywords):
+        sorted_results = ChatDialog._rank_findcode_results(reader, keywords)
+        if not sorted_results:
+            return "No likely relevant files were found."
+
+        lines = ["Likely relevant files:"]
+        for relative_path, details in sorted_results[:10]:
+            lines.append(f"\n{relative_path}")
+            if details["matches"]:
+                lines.append(f"- {', '.join(details['matches'][:5])}")
+        lines.append("\nYou can inspect one with:\n/analyze <relative/path/to/file>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _rank_findcode_results(reader, keywords):
+        ranked_results = {}
+        for keyword in keywords:
+            for item in reader.search_files(keyword, max_results=10):
+                entry = ranked_results.setdefault(
+                    item["path"],
+                    {"score": 0, "matches": [], "keywords": []}
+                )
+                entry["score"] += 1
+                if keyword not in entry["keywords"]:
+                    entry["keywords"].append(keyword)
+                for match in item["matches"]:
+                    if match not in entry["matches"]:
+                        entry["matches"].append(match)
+
+        return sorted(
+            ranked_results.items(),
+            key=lambda item: (-item[1]["score"], item[0])
+        )
+
+    @staticmethod
+    def _gather_code_context(reader, keywords):
+        candidate_files = ChatDialog._rank_findcode_results(
+            reader,
+            keywords
+        )[:3]
+        if not candidate_files:
+            return "No likely relevant files were found."
+
+        max_context_chars = 12000
+        completion_text = "Context ready."
+        context_parts = ["Context gathered:"]
+        used_chars = len(context_parts[0])
+        function_count = 0
+        for relative_path, details in candidate_files:
+            try:
+                content = reader.read_file(relative_path)
+            except ValueError:
+                continue
+
+            if any(
+                ord(character) < 32 and character not in "\t\n\f\r"
+                for character in content
+            ):
+                continue
+
+            if relative_path.lower().endswith(".py"):
+                functions = ProjectReader.extract_python_functions(content)
+                if functions is not None:
+                    selected_functions = ChatDialog._select_context_functions(
+                        functions,
+                        details
+                    )
+                    if selected_functions:
+                        remaining_chars = (
+                            max_context_chars
+                            - used_chars
+                            - len(completion_text)
+                            - 2
+                        )
+                        fitting_functions = []
+                        for function in selected_functions:
+                            if function_count + len(fitting_functions) >= 6:
+                                break
+                            candidate_functions = fitting_functions + [function]
+                            file_context = (
+                                ChatDialog._format_python_functions(
+                                    relative_path,
+                                    candidate_functions
+                                )
+                            )
+                            if len(file_context) <= remaining_chars:
+                                fitting_functions.append(function)
+
+                        if fitting_functions:
+                            file_context = ChatDialog._format_python_functions(
+                                relative_path,
+                                fitting_functions
+                            )
+                            context_parts.append(file_context)
+                            used_chars += len(file_context) + 1
+                            function_count += len(fitting_functions)
+                            continue
+                        if function_count >= 6:
+                            continue
+
+            lines = content.splitlines()
+            matching_lines = [
+                index for index, line in enumerate(lines)
+                if any(keyword in line.casefold() for keyword in details["keywords"])
+            ]
+            selected_lines = set()
+            for index in matching_lines:
+                selected_lines.update(
+                    range(max(0, index - 2), min(len(lines), index + 3))
+                )
+
+            file_lines = [relative_path]
+            if selected_lines:
+                ordered_lines = sorted(selected_lines)[:80]
+                file_lines.extend(
+                    f"{line_number + 1}: {lines[line_number]}"
+                    for line_number in ordered_lines
+                )
+            else:
+                file_lines.append("No matching content lines found.")
+
+            file_context = "\n".join(file_lines)
+            remaining_chars = (
+                max_context_chars
+                - used_chars
+                - len(completion_text)
+                - 2
+            )
+            if remaining_chars <= 0:
+                break
+            if len(file_context) > remaining_chars:
+                file_context = file_context[:remaining_chars]
+            context_parts.append(file_context)
+            used_chars += len(file_context) + 1
+
+        if len(context_parts) == 1:
+            return "No readable matching snippets were found."
+        context_parts.append(completion_text)
+        return "\n".join(context_parts)
+
+    @staticmethod
+    def _select_context_functions(functions, details):
+        keywords = [keyword.casefold() for keyword in details["keywords"]]
+        symbols = {
+            identifier.casefold()
+            for match in details["matches"]
+            for identifier in re.findall(r"[A-Za-z_]\w*", match)
+            if "_" in identifier
+        }
+        scored_functions = []
+        for function in functions:
+            name = function["name"].casefold()
+            qualified_name = function["qualified_name"].casefold()
+            source = function["source"].casefold()
+            score = sum(
+                5 for symbol in symbols
+                if symbol in qualified_name
+            )
+            score += sum(
+                4 for keyword in keywords
+                if keyword in qualified_name
+            )
+            score += sum(
+                1 for keyword in keywords
+                if keyword in source
+            )
+            if score:
+                scored_functions.append((function, score))
+
+        scored_functions.sort(
+            key=lambda item: (-item[1], item[0]["start_line"])
+        )
+        if not scored_functions:
+            return []
+
+        selected = [scored_functions[0][0]]
+        selected_names = {selected[0]["name"]}
+        relevant_parts = {
+            part
+            for part in re.findall(r"[a-z0-9]+", selected[0]["name"].casefold())
+            if len(part) > 2
+        }
+        for function, score in scored_functions[1:]:
+            if score >= 4 and function["name"] not in selected_names:
+                selected.append(function)
+                selected_names.add(function["name"])
+                relevant_parts.update(
+                    part for part in re.findall(
+                        r"[a-z0-9]+",
+                        function["name"].casefold()
+                    )
+                    if len(part) > 2
+                )
+
+        if len(selected) < 6:
+            selected_call_names = {
+                called_name
+                for function in selected
+                for called_name in function["calls"]
+            }
+            for function in functions:
+                if function["name"] in selected_names:
+                    continue
+                name_parts = set(
+                    re.findall(r"[a-z0-9]+", function["name"].casefold())
+                )
+                is_related = (
+                    function["name"] in selected_call_names
+                    or bool(name_parts & relevant_parts)
+                )
+                if is_related:
+                    selected.append(function)
+                    selected_names.add(function["name"])
+                    if len(selected) == 6:
+                        break
+
+        return sorted(selected, key=lambda function: function["start_line"])
+
+    @staticmethod
+    def _format_python_functions(relative_path, functions):
+        sections = [f"FILE: {relative_path}"]
+        for function in functions:
+            sections.append(
+                f"\nFUNCTION: {function['qualified_name']}\n"
+                f"{function['source']}"
+            )
+        return "\n".join(sections)
+
+    @staticmethod
+    def _project_identity(project):
+        if project is None:
+            return None
+        project_id = project[0] if len(project) > 0 else None
+        project_folder = project[2] if len(project) > 2 else None
+        return project_id, str(project_folder).casefold() if project_folder else None
 
     def prepare_file_analysis(self, message):
         if message == "/analyze" or message.startswith("/analyze "):

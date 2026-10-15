@@ -1,4 +1,6 @@
+import ast
 import os
+import re
 from pathlib import Path
 
 
@@ -12,6 +14,11 @@ class ProjectReader:
         "dist",
         "build",
         "coverage",
+        "cache",
+        ".cache",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
         ".idea",
         ".vscode"
     }
@@ -108,6 +115,68 @@ class ProjectReader:
 
         return sorted(file_paths)
 
+    def search_files(self, query, max_results=10):
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Enter a search query.")
+        if not isinstance(max_results, int) or max_results < 1:
+            raise ValueError("The maximum number of results must be positive.")
+
+        query = query.strip().casefold()
+        results = []
+        for relative_path in self.list_files():
+            path_matches = []
+            for part in Path(relative_path).parts:
+                if query in part.casefold():
+                    path_matches.append(part)
+
+            content_matches = []
+            file_path = self._resolve_allowed_file(relative_path)
+            try:
+                with file_path.open("rb") as project_file:
+                    file_bytes = project_file.read(self.MAX_FILE_SIZE + 1)
+                if (
+                    len(file_bytes) > self.MAX_FILE_SIZE
+                    or any(
+                        byte < 32 and byte not in (9, 10, 12, 13)
+                        for byte in file_bytes
+                    )
+                ):
+                    continue
+                content = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            for line in content.splitlines():
+                if query not in line.casefold():
+                    continue
+                tokens = re.findall(r"[A-Za-z0-9_./-]+", line.strip())
+                matching_tokens = [
+                    token for token in tokens
+                    if query in token.casefold()
+                ]
+                match_text = matching_tokens or [line.strip()]
+                for match in match_text:
+                    if match and match not in content_matches:
+                        content_matches.append(match[:120])
+                    if len(content_matches) >= 5:
+                        break
+                if len(content_matches) >= 5:
+                    break
+
+            matches = path_matches + content_matches
+            if matches:
+                results.append({
+                    "path": relative_path,
+                    "matches": matches[:5],
+                    "score": len(matches)
+                })
+
+        results.sort(key=lambda result: (-result["score"], result["path"]))
+        return [
+            {"path": result["path"], "matches": result["matches"]}
+            for result in results[:max_results]
+        ]
+
     def read_file(self, relative_path):
         file_path = self._resolve_allowed_file(relative_path)
 
@@ -120,6 +189,66 @@ class ProjectReader:
                 return project_file.read()
         except UnicodeDecodeError as error:
             raise ValueError("That file is not readable as UTF-8 text.") from error
+
+    @staticmethod
+    def extract_python_functions(source):
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+
+        source_lines = source.splitlines()
+        functions = []
+
+        class CallCollector(ast.NodeVisitor):
+            def __init__(self):
+                self.names = set()
+
+            def visit_FunctionDef(self, node):
+                return
+
+            def visit_AsyncFunctionDef(self, node):
+                return
+
+            def visit_Call(self, node):
+                function = node.func
+                while isinstance(function, ast.Attribute):
+                    self.names.add(function.attr)
+                    function = function.value
+                if isinstance(function, ast.Name):
+                    self.names.add(function.id)
+                self.generic_visit(node)
+
+        def visit_body(nodes, parent_names=()):
+            for node in nodes:
+                if isinstance(node, ast.ClassDef):
+                    visit_body(node.body, parent_names + (node.name,))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    start_line = min(
+                        [node.lineno]
+                        + [decorator.lineno for decorator in node.decorator_list]
+                    )
+                    end_line = getattr(node, "end_lineno", node.lineno)
+                    calls = CallCollector()
+                    for child in node.body:
+                        calls.visit(child)
+                    functions.append({
+                        "name": node.name,
+                        "qualified_name": ".".join(parent_names + (node.name,)),
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "source": "\n".join(
+                            source_lines[start_line - 1:end_line]
+                        ),
+                        "calls": calls.names
+                    })
+                    visit_body(
+                        node.body,
+                        parent_names + (node.name,)
+                    )
+
+        visit_body(tree.body)
+        return functions
 
     def _resolve_allowed_file(self, relative_path):
         requested_path = Path(relative_path)
