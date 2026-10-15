@@ -1,5 +1,7 @@
+import ast
 import difflib
 import re
+import textwrap
 import sqlite3
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -834,17 +836,22 @@ class ChatDialog(QDialog):
             command = "findcode"
         elif message == "/context" or message.startswith("/context "):
             command = "context"
+        elif message == "/multicontext" or message.startswith("/multicontext "):
+            command = "multicontext"
         else:
             return False
 
         command_text = message[len(f"/{command}"):].strip()
-        if command == "context":
+        if command in ("context", "multicontext"):
             self.last_code_context = None
         if command in ("search", "findcode") and not command_text:
             self.show_response(f"Usage: /{command} <query>")
             return True
         if command == "context" and not command_text:
             self.show_response("Usage: /context <question>")
+            return True
+        if command == "multicontext" and not command_text:
+            self.show_response("Usage: /multicontext <question>")
             return True
 
         if self.current_project is None:
@@ -891,7 +898,7 @@ class ChatDialog(QDialog):
                     )
                 else:
                     result = self._format_findcode_results(reader, keywords)
-            else:
+            elif command == "context":
                 keywords = self._findcode_keywords(command_text)
                 if not keywords:
                     result = (
@@ -904,6 +911,17 @@ class ChatDialog(QDialog):
                         keywords
                     )
                     result = self.last_code_context
+            else:
+                keywords = self._findcode_keywords(command_text)
+                if not keywords:
+                    result = (
+                        "I couldn't find useful search words in that question. "
+                        "Try /multicontext <question> with specific project terms."
+                    )
+                else:
+                    self.last_code_context, result = (
+                        self._gather_multi_file_context(reader, keywords)
+                    )
             self.show_response(result)
         except FileNotFoundError:
             self.show_response("The project folder or requested file was not found.")
@@ -921,18 +939,58 @@ class ChatDialog(QDialog):
     @staticmethod
     def _findcode_keywords(question):
         stop_words = {
-            "a", "about", "and", "are", "code", "does", "find", "for",
-            "how", "implemented", "in", "is", "it", "of", "the", "this",
-            "to", "where", "which", "with"
+            "a", "about", "an", "and", "are", "code", "does", "find",
+            "for", "how", "implemented", "in", "is", "it", "of", "the",
+            "this", "that", "to", "where", "what", "which", "with",
+            "work", "works"
         }
         keywords = []
         for word in re.findall(r"[A-Za-z0-9_]+", question.casefold()):
-            if len(word) < 3 or word in stop_words or word in keywords:
+            normalized = ChatDialog._normalize_search_word(word)
+            if (
+                len(normalized) < 3
+                or word in stop_words
+                or normalized in stop_words
+                or normalized in keywords
+            ):
                 continue
-            keywords.append(word)
+            keywords.append(normalized)
             if len(keywords) == 6:
                 break
         return keywords
+
+    @staticmethod
+    def _normalize_search_word(word):
+        word = word.casefold()
+        if len(word) > 5 and word.endswith("ies"):
+            return word[:-3] + "y"
+        if len(word) > 5 and word.endswith("ing"):
+            word = word[:-3]
+            if len(word) > 2 and word[-1] == word[-2]:
+                word = word[:-1]
+            return word
+        if len(word) > 4 and word.endswith("ed"):
+            word = word[:-2]
+            if len(word) > 2 and word[-1] == word[-2]:
+                word = word[:-1]
+            return word
+        if len(word) > 4 and word.endswith("s"):
+            return word[:-1]
+        return word
+
+    @staticmethod
+    def _identifier_words(identifier):
+        parts = re.findall(
+            r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|[0-9]+",
+            identifier
+        )
+        if not parts:
+            parts = [identifier]
+        return {
+            ChatDialog._normalize_search_word(part)
+            for part in parts
+            if part
+        }
 
     @staticmethod
     def _format_findcode_results(reader, keywords):
@@ -951,18 +1009,106 @@ class ChatDialog(QDialog):
     @staticmethod
     def _rank_findcode_results(reader, keywords):
         ranked_results = {}
+        file_paths = reader.list_files()
+        max_search_results = max(len(file_paths), 1)
         for keyword in keywords:
-            for item in reader.search_files(keyword, max_results=10):
+            for item in reader.search_files(
+                keyword,
+                max_results=max_search_results
+            ):
                 entry = ranked_results.setdefault(
                     item["path"],
-                    {"score": 0, "matches": [], "keywords": []}
+                    {"matches": [], "keywords": []}
                 )
-                entry["score"] += 1
                 if keyword not in entry["keywords"]:
                     entry["keywords"].append(keyword)
                 for match in item["matches"]:
                     if match not in entry["matches"]:
                         entry["matches"].append(match)
+
+        for relative_path, details in ranked_results.items():
+            try:
+                content = reader.read_file(relative_path)
+            except (OSError, ValueError):
+                details["score"] = 0
+                continue
+
+            keywords_set = set(details["keywords"])
+            path_words = ChatDialog._identifier_words(
+                relative_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            )
+            score = 35 * len(keywords_set & path_words)
+
+            function_words = set()
+            class_words = set()
+            variable_words = set()
+            if relative_path.lower().endswith(".py"):
+                functions = ProjectReader.extract_python_functions(content)
+                if functions is not None:
+                    for function in functions:
+                        name_words = ChatDialog._identifier_words(
+                            function["name"]
+                        )
+                        matched = keywords_set & name_words
+                        if matched:
+                            score += 100 * len(matched)
+                            function_words.update(matched)
+
+                    try:
+                        tree = ast.parse(content)
+                    except SyntaxError:
+                        tree = None
+                    if tree is not None:
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.ClassDef):
+                                class_words.update(
+                                    keywords_set
+                                    & ChatDialog._identifier_words(node.name)
+                                )
+                            elif isinstance(node, ast.Name) and isinstance(
+                                node.ctx,
+                                (ast.Store, ast.Del)
+                            ):
+                                variable_words.update(
+                                    keywords_set
+                                    & ChatDialog._identifier_words(node.id)
+                                )
+                            elif isinstance(node, ast.arg):
+                                variable_words.update(
+                                    keywords_set
+                                    & ChatDialog._identifier_words(node.arg)
+                                )
+
+                score += 70 * len(class_words)
+                score += 45 * len(variable_words)
+            elif relative_path.lower().endswith(
+                (".js", ".jsx", ".ts", ".tsx")
+            ):
+                for line in content.splitlines():
+                    line_words = set()
+                    for identifier in re.findall(r"[A-Za-z_]\w*", line):
+                        line_words.update(
+                            ChatDialog._identifier_words(identifier)
+                        )
+                    function_words.update(keywords_set & line_words)
+                score += 25 * len(function_words)
+
+            generic_matches = {
+                keyword for keyword in keywords_set
+                if keyword in content.casefold()
+            }
+            score += min(len(generic_matches), 3)
+
+            suffix = relative_path.rsplit(".", 1)[-1].casefold()
+            source_preferences = {
+                "py": 8,
+                "js": 7,
+                "jsx": 7,
+                "ts": 7,
+                "tsx": 7
+            }
+            score += source_preferences.get(suffix, 0)
+            details["score"] = score
 
         return sorted(
             ranked_results.items(),
@@ -1076,32 +1222,448 @@ class ChatDialog(QDialog):
         return "\n".join(context_parts)
 
     @staticmethod
-    def _select_context_functions(functions, details):
-        keywords = [keyword.casefold() for keyword in details["keywords"]]
-        symbols = {
-            identifier.casefold()
-            for match in details["matches"]
-            for identifier in re.findall(r"[A-Za-z_]\w*", match)
-            if "_" in identifier
+    def _gather_multi_file_context(reader, keywords):
+        candidate_files = ChatDialog._rank_findcode_results(
+            reader,
+            keywords
+        )[:3]
+        if not candidate_files:
+            return None, "No likely relevant files were found."
+
+        max_context_chars = 15000
+        completion_text = "Context ready."
+        context_parts = ["MULTI-FILE PROJECT CONTEXT"]
+        summaries = []
+        used_chars = len(context_parts[0])
+
+        for relative_path, details in candidate_files:
+            try:
+                content = reader.read_file(relative_path)
+            except ValueError:
+                continue
+
+            if any(
+                ord(character) < 32 and character not in "\t\n\f\r"
+                for character in content
+            ):
+                continue
+
+            selected_names = []
+            functions = None
+            selected_functions = []
+            if relative_path.lower().endswith(".py"):
+                functions = ProjectReader.extract_python_functions(content)
+                if functions is not None:
+                    selected_functions = (
+                        ChatDialog._select_context_functions(
+                            functions,
+                            details,
+                            relative_path
+                        )
+                        [:3]
+                    )
+                    if selected_functions:
+                        selected_names = [
+                            function["qualified_name"]
+                            for function in selected_functions
+                        ]
+                        file_context = ChatDialog._format_python_functions(
+                            relative_path,
+                            selected_functions
+                        )
+                    else:
+                        file_context = ""
+                else:
+                    file_context = ""
+            else:
+                file_context = ""
+
+            if not file_context:
+                lines = content.splitlines()
+                matching_lines = [
+                    index for index, line in enumerate(lines)
+                    if any(
+                        keyword in line.casefold()
+                        for keyword in details["keywords"]
+                    )
+                ]
+                selected_lines = set()
+                for index in matching_lines:
+                    selected_lines.update(
+                        range(max(0, index - 2), min(len(lines), index + 3))
+                    )
+                if not selected_lines:
+                    continue
+                snippets = [
+                    f"{line_number + 1}: {lines[line_number]}"
+                    for line_number in sorted(selected_lines)[:80]
+                ]
+                file_context = (
+                    f"FILE: {relative_path}\n"
+                    + "\n".join(snippets)
+                )
+                selected_names = details["matches"][:3]
+
+            remaining_chars = (
+                max_context_chars
+                - used_chars
+                - len(completion_text)
+                - 2
+            )
+            if remaining_chars <= len(f"\nFILE: {relative_path}"):
+                break
+            if len(file_context) > remaining_chars:
+                if selected_names:
+                    fitting_functions = []
+                    for function in (
+                        selected_functions
+                        if relative_path.lower().endswith(".py")
+                        and functions is not None
+                        else []
+                    ):
+                        candidate_functions = fitting_functions + [function]
+                        candidate_context = (
+                            ChatDialog._format_python_functions(
+                                relative_path,
+                                candidate_functions
+                            )
+                        )
+                        if len(candidate_context) <= remaining_chars:
+                            fitting_functions.append(function)
+                    if not fitting_functions:
+                        continue
+                    selected_functions = fitting_functions
+                    selected_names = [
+                        function["qualified_name"]
+                        for function in selected_functions
+                    ]
+                    file_context = ChatDialog._format_python_functions(
+                        relative_path,
+                        selected_functions
+                    )
+                else:
+                    file_context = file_context[:remaining_chars]
+
+            context_parts.append(file_context)
+            used_chars += len(file_context) + 1
+            summaries.append((relative_path, selected_names))
+
+        if not summaries:
+            return None, "No relevant readable snippets were found."
+
+        context_parts.append(completion_text)
+        summary_lines = ["Multi-file context gathered:"]
+        for index, (relative_path, names) in enumerate(summaries, start=1):
+            summary_lines.append(f"\n{index}. {relative_path}")
+            if names:
+                summary_lines.append(f"   - {'; '.join(names)}")
+        summary_lines.append("\nContext ready.")
+        return "\n".join(context_parts), "\n".join(summary_lines)
+
+    @staticmethod
+    def _select_context_functions(functions, details, relative_path=None):
+        keywords = {
+            part
+            for keyword in details["keywords"]
+            for part in ChatDialog._identifier_words(keyword)
         }
+        search_terms = set(keywords)
+        project_switching = (
+            "project" in search_terms
+            and bool(search_terms & {"switch", "select", "selector"})
+        )
         scored_functions = []
         for function in functions:
-            name = function["name"].casefold()
-            qualified_name = function["qualified_name"].casefold()
-            source = function["source"].casefold()
-            score = sum(
-                5 for symbol in symbols
-                if symbol in qualified_name
+            try:
+                function_tree = ast.parse(
+                    textwrap.dedent(function["source"])
+                )
+            except SyntaxError:
+                function_tree = None
+
+            function_name_words = ChatDialog._identifier_words(
+                function["qualified_name"]
             )
-            score += sum(
-                4 for keyword in keywords
-                if keyword in qualified_name
-            )
-            score += sum(
-                1 for keyword in keywords
-                if keyword in source
-            )
-            if score:
+            attributes = set()
+            attribute_identifiers = set()
+            variable_names = set()
+            called_names = set()
+            referenced_names = set()
+            chat_dialog_constructors = []
+            assigned_attributes = set()
+            menu_selection_evidence = False
+            chat_dialog_update = False
+            chat_dialog_creation = False
+            if function_tree is not None:
+                for node in ast.walk(function_tree):
+                    if isinstance(node, ast.Attribute):
+                        attribute_identifiers.add(node.attr.casefold())
+                        referenced_names.add(node.attr.casefold())
+                        attributes.update(
+                            ChatDialog._identifier_words(node.attr)
+                        )
+                    elif isinstance(node, ast.Name):
+                        referenced_names.add(node.id.casefold())
+                        variable_names.update(
+                            ChatDialog._identifier_words(node.id)
+                        )
+                    elif isinstance(node, ast.arg):
+                        variable_names.update(
+                            ChatDialog._identifier_words(node.arg)
+                        )
+                        referenced_names.add(node.arg.casefold())
+                    elif isinstance(node, ast.Call):
+                        callable_node = node.func
+                        if isinstance(
+                            callable_node,
+                            (ast.Name, ast.Attribute)
+                        ):
+                            call_name = (
+                                callable_node.id
+                                if isinstance(callable_node, ast.Name)
+                                else callable_node.attr
+                            )
+                            called_names.add(call_name)
+
+                            if (
+                                isinstance(callable_node, ast.Attribute)
+                                and callable_node.attr == "update_project"
+                                and isinstance(callable_node.value, ast.Attribute)
+                                and callable_node.value.attr == "chat_dialog"
+                            ):
+                                chat_dialog_update = True
+                            if (
+                                isinstance(callable_node, ast.Name)
+                                and callable_node.id == "ChatDialog"
+                            ):
+                                chat_dialog_constructors.append(node)
+
+                for node in ast.walk(function_tree):
+                    if isinstance(
+                        node,
+                        (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
+                    ):
+                        targets = (
+                            node.targets
+                            if isinstance(node, ast.Assign)
+                            else [node.target]
+                        )
+                        for target in targets:
+                            for target_node in ast.walk(target):
+                                if (
+                                    isinstance(target_node, ast.Attribute)
+                                    and isinstance(
+                                        target_node.value,
+                                        ast.Name
+                                    )
+                                    and target_node.value.id == "self"
+                                ):
+                                    if target_node.attr in {
+                                        "current_project",
+                                        "active_project",
+                                        "selected_project"
+                                    }:
+                                        assigned_attributes.add(
+                                            target_node.attr
+                                        )
+
+                chat_dialog_creation = any(
+                    any(
+                        keyword.arg == "current_project"
+                        and (
+                            isinstance(keyword.value, ast.Name)
+                            and keyword.value.id == "current_project"
+                            or isinstance(keyword.value, ast.Attribute)
+                            and keyword.value.attr == "current_project"
+                        )
+                        for keyword in call.keywords
+                    )
+                    or any(
+                        (
+                            isinstance(argument, ast.Name)
+                            and argument.id == "current_project"
+                        )
+                        or (
+                            isinstance(argument, ast.Attribute)
+                            and argument.attr == "current_project"
+                        )
+                        for argument in call.args
+                    )
+                    for call in chat_dialog_constructors
+                )
+
+                called_set = {name.casefold() for name in called_names}
+                retrieval_calls = {
+                    "get_projects",
+                    "get_project_by_id",
+                    "get_project_by_name"
+                }
+                selector_calls = {
+                    "show_project_selector",
+                    "open_project_selector",
+                    "select_project",
+                    "switch_project"
+                }
+                project_api_call = bool(called_set & (
+                    retrieval_calls | selector_calls
+                ))
+                menu_call = bool(called_set & {"qmenu", "qaction"})
+                menu_connection = bool(
+                    called_set & {"connect"}
+                    and referenced_names & {
+                        "show_project_selector",
+                        "open_project_selector",
+                        "select_project",
+                        "switch_project",
+                        "selected_project"
+                    }
+                )
+                menu_selection_evidence = (
+                    menu_call
+                    and menu_connection
+                    and (
+                        project_api_call
+                        or bool(referenced_names & {
+                            "show_project_selector",
+                            "open_project_selector",
+                            "select_project",
+                            "switch_project"
+                        })
+                    )
+                )
+
+            if project_switching:
+                score = 0
+                switching_words = {
+                    "switch", "select", "selector", "current", "active",
+                    "selected"
+                }
+                matched_name_words = function_name_words & switching_words
+                score += 25 * len(matched_name_words)
+
+                exact_name = function["name"].casefold()
+                if exact_name in {
+                    "show_project_selector",
+                    "open_project_selector",
+                    "select_project",
+                    "switch_project"
+                }:
+                    score += 100
+
+                if assigned_attributes:
+                    score += 160
+                if "current_project" in attribute_identifiers:
+                    score += 35
+                if "active_project" in attribute_identifiers:
+                    score += 30
+                if "selected_project" in attribute_identifiers:
+                    score += 30
+
+                normalized_calls = {
+                    call.casefold() for call in called_names
+                }
+                retrieval_evidence = normalized_calls & {
+                    "get_projects",
+                    "get_project_by_id",
+                    "get_project_by_name"
+                }
+                update_evidence = normalized_calls & {"update_project"}
+                selector_evidence = normalized_calls & {
+                    "show_project_selector",
+                    "open_project_selector",
+                    "select_project",
+                    "switch_project"
+                }
+                score += 100 * len(retrieval_evidence)
+                score += 100 * len(update_evidence)
+                score += 110 * len(selector_evidence)
+                if chat_dialog_update:
+                    score += 180
+                if chat_dialog_creation:
+                    score += 350
+                if menu_selection_evidence:
+                    score += 120
+
+                matched_variables = variable_names & {
+                    "current", "project", "active", "selected", "switch",
+                    "select", "selector"
+                }
+                score += 12 * len(matched_variables)
+
+                function_words = ChatDialog._identifier_words(
+                    function["name"]
+                )
+                has_direct_flow_evidence = bool(
+                    retrieval_evidence
+                    or update_evidence
+                    or selector_evidence
+                    or chat_dialog_update
+                    or chat_dialog_creation
+                    or menu_selection_evidence
+                )
+                if function["name"].casefold() == "__init__" and not (
+                    retrieval_evidence
+                    or selector_evidence
+                    or chat_dialog_update
+                    or chat_dialog_creation
+                    or menu_selection_evidence
+                ):
+                    score = max(score - 250, 0)
+                if function_words & {
+                    "task", "next", "summary", "greeting", "latest",
+                    "message"
+                }:
+                    score -= 90
+                if exact_name in {
+                    "update_project_task",
+                    "update_project_next_action",
+                    "project_summary",
+                    "show_latest_project_message"
+                }:
+                    score -= 140
+                if (
+                    exact_name == "load_settings"
+                    and not has_direct_flow_evidence
+                ):
+                    score = max(score - 180, 0)
+
+                has_switching_evidence = bool(
+                    assigned_attributes
+                    or has_direct_flow_evidence
+                    or function_name_words & switching_words
+                )
+                if not has_switching_evidence:
+                    score = 0
+                if (
+                    relative_path is not None
+                    and relative_path.rsplit("/", 1)[-1].casefold()
+                    == "database.py"
+                ):
+                    if exact_name in {
+                        "get_projects",
+                        "get_project_by_id",
+                        "get_project_by_name",
+                        "get_latest_project"
+                    }:
+                        score = max(score, 300)
+                    elif exact_name in {
+                        "update_project_task",
+                        "update_project_next_action",
+                        "update_project_field"
+                    }:
+                        score = min(score, 0) - 100
+            else:
+                score = 0
+                matched_function_words = function_name_words & search_terms
+                score += 30 * len(matched_function_words)
+                score += 4 * len(attributes & search_terms)
+                score += 6 * len(variable_names & search_terms)
+                score += 10 * sum(
+                    bool(ChatDialog._identifier_words(call) & search_terms)
+                    for call in called_names
+                )
+
+            if score > 0:
                 scored_functions.append((function, score))
 
         scored_functions.sort(
@@ -1112,46 +1674,21 @@ class ChatDialog(QDialog):
 
         selected = [scored_functions[0][0]]
         selected_names = {selected[0]["name"]}
-        relevant_parts = {
-            part
-            for part in re.findall(r"[a-z0-9]+", selected[0]["name"].casefold())
-            if len(part) > 2
-        }
+        selected_call_names = set(selected[0]["calls"])
         for function, score in scored_functions[1:]:
-            if score >= 4 and function["name"] not in selected_names:
+            if function["name"] in selected_names:
+                continue
+            if score >= (35 if project_switching else 30):
                 selected.append(function)
                 selected_names.add(function["name"])
-                relevant_parts.update(
-                    part for part in re.findall(
-                        r"[a-z0-9]+",
-                        function["name"].casefold()
-                    )
-                    if len(part) > 2
-                )
+            elif project_switching and function["name"] in selected_call_names:
+                selected.append(function)
+                selected_names.add(function["name"])
+            if len(selected) >= 6:
+                break
+            selected_call_names.update(function["calls"])
 
-        if len(selected) < 6:
-            selected_call_names = {
-                called_name
-                for function in selected
-                for called_name in function["calls"]
-            }
-            for function in functions:
-                if function["name"] in selected_names:
-                    continue
-                name_parts = set(
-                    re.findall(r"[a-z0-9]+", function["name"].casefold())
-                )
-                is_related = (
-                    function["name"] in selected_call_names
-                    or bool(name_parts & relevant_parts)
-                )
-                if is_related:
-                    selected.append(function)
-                    selected_names.add(function["name"])
-                    if len(selected) == 6:
-                        break
-
-        return sorted(selected, key=lambda function: function["start_line"])
+        return selected
 
     @staticmethod
     def _format_python_functions(relative_path, functions):

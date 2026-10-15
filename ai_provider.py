@@ -5,7 +5,7 @@ import urllib.request
 
 class OllamaProvider:
     def __init__(self):
-        self.model = "qwen2.5-coder:3b"
+        self.model = "qwen2.5-coder:7b"
         self.server_url = "http://localhost:11434"
 
     def _create_system_message(
