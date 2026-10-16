@@ -108,17 +108,6 @@ class OllamaProvider:
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message}
             ]
-            if message == "/understand" or message.startswith("/understand "):
-                print("UNDERSTAND COMMAND DETECTED", flush=True)
-                print("===== UNDERSTAND DEBUG START =====", flush=True)
-                print("QUESTION:", flush=True)
-                print(message[len("/understand"):].strip(), flush=True)
-                print("CONTEXT:", flush=True)
-                print(code_context, flush=True)
-                print("FINAL PROMPT:", flush=True)
-                print(messages[0]["content"], flush=True)
-                print(messages[1]["content"], flush=True)
-                print("===== UNDERSTAND DEBUG END =====", flush=True)
             return self._send_chat(
                 messages,
                 options={"temperature": 0.1}
@@ -132,17 +121,6 @@ class OllamaProvider:
             },
             {"role": "user", "content": message}
         ]
-        if message == "/understand" or message.startswith("/understand "):
-            print("UNDERSTAND COMMAND DETECTED", flush=True)
-            print("===== UNDERSTAND DEBUG START =====", flush=True)
-            print("QUESTION:", flush=True)
-            print(message[len("/understand"):].strip(), flush=True)
-            print("CONTEXT:", flush=True)
-            print(code_context, flush=True)
-            print("FINAL PROMPT:", flush=True)
-            print(messages[0]["content"], flush=True)
-            print(messages[1]["content"], flush=True)
-            print("===== UNDERSTAND DEBUG END =====", flush=True)
         return self._send_chat(messages)
 
     def analyze_file(
