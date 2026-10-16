@@ -289,6 +289,9 @@ class ChatDialog(QDialog):
         if not message:
             return
 
+        if message == "/understand" or message.startswith("/understand "):
+            print("UNDERSTAND COMMAND DETECTED", flush=True)
+
         if (
             self.parent() is not None
             and hasattr(self.parent(), "current_project")

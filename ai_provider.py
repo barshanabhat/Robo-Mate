@@ -5,7 +5,7 @@ import urllib.request
 
 class OllamaProvider:
     def __init__(self):
-        self.model = "qwen2.5-coder:7b"
+        self.model = "qwen2.5-coder:3b"
         self.server_url = "http://localhost:11434"
 
     def _create_system_message(
@@ -82,67 +82,43 @@ class OllamaProvider:
     def ask(self, message, project_context=None, code_context=None):
         if code_context:
             system_message = (
-                "You are RoboMate, a local coding companion. "
-                "You are in STRICT CODE-CONTEXT MODE.\n"
-                "This mode has priority over any general debugging or "
-                "helpfulness behavior.\n"
-                "You may ONLY make claims that are directly supported by "
-                "the provided PROJECT CODE CONTEXT.\n"
-                "Do not use general software troubleshooting knowledge.\n"
-                "Do not mention operating system issues, permissions, "
-                "dependencies, environment configuration, network issues, "
-                "third-party library failures, random failures, or GUI "
-                "issues unless they are explicitly visible in the provided "
-                "code context.\n"
-                "Do not use information outside CODE_CONTEXT for "
-                "code-specific claims.\n"
-                "Do not guess or invent functions, variables, timers, "
-                "systems, causes, or behavior.\n"
-                "If evidence is missing, state exactly: 'Not enough code "
-                "context to determine this.'\n"
-                "Do not include generic debugging tips.\n"
-                "Use this answer format:\n"
-                "Concrete findings from the provided code:\n"
-                "1. <function or variable>\n"
-                "   - What the code does\n"
-                "   - Why this can affect the behavior\n"
-                "2. <function or variable>\n"
-                "   - What the code does\n"
-                "   - Why this can affect the behavior\n"
-                "Missing context:\n"
-                "- <specific function needed>, if necessary\n"
-                "First identify concrete conditions visible in the code. "
-                "For each finding, name the exact function or variable, "
-                "describe what it does, and explain how it affects the "
-                "behavior. Include only findings supported by the supplied "
-                "context."
+                "You are RoboMate in strict code-context mode. Use only the "
+                "supplied CODE CONTEXT as evidence. Do not use outside "
+                "knowledge to infer or invent behavior that is not visible "
+                "there. Explain how the implementation works across the "
+                "actual files and functions provided, naming relevant file "
+                "and function/method names when useful. Focus on how the "
+                "code works, not on how a user might theoretically use the "
+                "application. Do not give generic user instructions unless "
+                "they are directly supported by the supplied code. If "
+                "something cannot be determined from the supplied context, "
+                "say exactly: 'The provided context does not show that.'"
             )
-            if project_context is not None:
-                project_metadata = (
-                    f"Name: {project_context[1]}\n"
-                    f"Folder: {project_context[2] or ''}\n"
-                    f"Description: {project_context[3] or ''}\n"
-                    f"Technologies: {project_context[4] or ''}\n"
-                    f"Current task: {project_context[5] or ''}\n"
-                    f"Next action: {project_context[6] or ''}"
-                )
-            else:
-                project_metadata = "No project metadata provided."
 
             user_message = (
-                "PROJECT METADATA:\n"
-                f"{project_metadata}\n\n"
-                "PROJECT CODE CONTEXT:\n"
+                "QUESTION:\n"
+                f"{message}\n\n"
+                "CODE CONTEXT:\n"
                 "<<<CODE_CONTEXT_START>>>\n"
-                f"{code_context}\n\n"
+                f"{code_context}\n"
                 "<<<CODE_CONTEXT_END>>>\n\n"
-                "USER QUESTION:\n"
-                f"{message}"
+                "Explain the implementation based only on this evidence."
             )
             messages = [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message}
             ]
+            if message == "/understand" or message.startswith("/understand "):
+                print("UNDERSTAND COMMAND DETECTED", flush=True)
+                print("===== UNDERSTAND DEBUG START =====", flush=True)
+                print("QUESTION:", flush=True)
+                print(message[len("/understand"):].strip(), flush=True)
+                print("CONTEXT:", flush=True)
+                print(code_context, flush=True)
+                print("FINAL PROMPT:", flush=True)
+                print(messages[0]["content"], flush=True)
+                print(messages[1]["content"], flush=True)
+                print("===== UNDERSTAND DEBUG END =====", flush=True)
             return self._send_chat(
                 messages,
                 options={"temperature": 0.1}
@@ -156,6 +132,17 @@ class OllamaProvider:
             },
             {"role": "user", "content": message}
         ]
+        if message == "/understand" or message.startswith("/understand "):
+            print("UNDERSTAND COMMAND DETECTED", flush=True)
+            print("===== UNDERSTAND DEBUG START =====", flush=True)
+            print("QUESTION:", flush=True)
+            print(message[len("/understand"):].strip(), flush=True)
+            print("CONTEXT:", flush=True)
+            print(code_context, flush=True)
+            print("FINAL PROMPT:", flush=True)
+            print(messages[0]["content"], flush=True)
+            print(messages[1]["content"], flush=True)
+            print("===== UNDERSTAND DEBUG END =====", flush=True)
         return self._send_chat(messages)
 
     def analyze_file(
