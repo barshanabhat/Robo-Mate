@@ -1258,7 +1258,8 @@ class ChatDialog(QDialog):
                         ChatDialog._select_context_functions(
                             functions,
                             details,
-                            relative_path
+                            relative_path,
+                            query_keywords=keywords
                         )
                         [:3]
                     )
@@ -1361,13 +1362,30 @@ class ChatDialog(QDialog):
         return "\n".join(context_parts), "\n".join(summary_lines)
 
     @staticmethod
-    def _select_context_functions(functions, details, relative_path=None):
+    def _select_context_functions(
+        functions,
+        details,
+        relative_path=None,
+        query_keywords=None
+    ):
         keywords = {
             part
             for keyword in details["keywords"]
             for part in ChatDialog._identifier_words(keyword)
         }
         search_terms = set(keywords)
+        query_terms = {
+            part
+            for keyword in query_keywords or details["keywords"]
+            for part in ChatDialog._identifier_words(keyword)
+        }
+        project_intent = (
+            "project" in query_terms
+            and bool(query_terms & {
+                "switch", "select", "selector", "current", "active",
+                "lookup", "get"
+            })
+        )
         project_switching = (
             "project" in search_terms
             and bool(search_terms & {"switch", "select", "selector"})
@@ -1662,6 +1680,13 @@ class ChatDialog(QDialog):
                     bool(ChatDialog._identifier_words(call) & search_terms)
                     for call in called_names
                 )
+                if project_intent:
+                    score += 20 * len(
+                        function_name_words & {
+                            "get", "select", "selector", "current", "active",
+                            "load", "open", "switch"
+                        }
+                    )
 
             if score > 0:
                 scored_functions.append((function, score))
