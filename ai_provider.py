@@ -80,9 +80,13 @@ class OllamaProvider:
             return "Ollama returned an invalid response. Please try again."
 
     def ask(self, message, project_context=None, code_context=None):
+        system_message = (
+            "ROBO MATE INSTRUCTIONS:\n"
+            + self._create_system_message()
+        )
         if code_context:
-            system_message = (
-                "You are RoboMate in strict code-context mode. Use only the "
+            system_message += (
+                "\n\nSTRICT CODE-CONTEXT MODE: Use only the "
                 "supplied CODE CONTEXT as evidence. Do not use outside "
                 "knowledge to infer or invent behavior that is not visible "
                 "there. Explain how the implementation works across the "
@@ -95,32 +99,35 @@ class OllamaProvider:
                 "say exactly: 'The provided context does not show that.'"
             )
 
-            user_message = (
-                "QUESTION:\n"
-                f"{message}\n\n"
+        user_sections = []
+        if project_context is not None:
+            user_sections.append(
+                "CURRENT PROJECT:\n"
+                f"Name: {project_context[1]}\n"
+                f"Folder: {project_context[2] or ''}\n"
+                f"Description: {project_context[3] or ''}\n"
+                f"Technologies: {project_context[4] or ''}\n"
+                f"Current task: {project_context[5] or ''}\n"
+                f"Next action: {project_context[6] or ''}"
+            )
+        if code_context:
+            user_sections.append(
                 "CODE CONTEXT:\n"
                 "<<<CODE_CONTEXT_START>>>\n"
                 f"{code_context}\n"
-                "<<<CODE_CONTEXT_END>>>\n\n"
-                "Explain the implementation based only on this evidence."
+                "<<<CODE_CONTEXT_END>>>"
             )
-            messages = [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message}
-            ]
-            return self._send_chat(
-                messages,
-                options={"temperature": 0.1}
-            )
+        user_sections.append(f"USER QUESTION:\n{message}")
 
-        system_message = self._create_system_message(project_context)
         messages = [
             {
                 "role": "system",
                 "content": system_message
             },
-            {"role": "user", "content": message}
+            {"role": "user", "content": "\n\n".join(user_sections)}
         ]
+        if code_context:
+            return self._send_chat(messages, options={"temperature": 0.1})
         return self._send_chat(messages)
 
     def analyze_file(
